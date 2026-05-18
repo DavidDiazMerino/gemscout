@@ -3,7 +3,6 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'rea
 import {
   Activity,
   BadgeEuro,
-  Bot,
   ChevronDown,
   CircleAlert,
   CircleDot,
@@ -1552,6 +1551,7 @@ function App() {
             </div>
           </section>
         </div>
+      </>}
       </div>
       {isShareDialogOpen ? (
         <div className="fixed inset-0 z-50 grid place-items-center bg-black/70 px-4">
@@ -1787,11 +1787,7 @@ function ComparePanel({
           ))}
         </div>
       </div>
-
-        </> /* end explorer mode */}
-
-      </div>
-    </main>
+    </div>
   )
 }
 

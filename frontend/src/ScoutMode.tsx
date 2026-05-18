@@ -3,7 +3,7 @@
  * Natural language → MongoDB Atlas Vector Search → Gemini scouting report.
  */
 
-import { useEffect, useRef, useState } from 'react'
+import { useRef, useState } from 'react'
 import {
   Bot,
   ChevronRight,
@@ -317,7 +317,7 @@ export default function ScoutMode() {
     setStreamingSteps([...simulatedSteps])
 
     // Add steps progressively for better UX
-    const timers: NodeJS.Timeout[] = []
+    const timers: ReturnType<typeof setTimeout>[] = []
     timers.push(
       setTimeout(() => {
         setStreamingSteps((prev) => [
