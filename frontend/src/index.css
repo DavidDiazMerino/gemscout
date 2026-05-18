@@ -1,0 +1,191 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: dark;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: #07080a;
+  color: #f8fafc;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+select {
+  width: 100%;
+  min-width: 0;
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: #f8fafc;
+  outline: none;
+}
+
+select option {
+  background: #101318;
+  color: #f8fafc;
+}
+
+.preset-input {
+  min-height: 36px;
+  min-width: 0;
+  border: 1px solid rgb(255 255 255 / 0.1);
+  border-radius: 8px;
+  background: rgb(255 255 255 / 0.04);
+  color: #f8fafc;
+  outline: none;
+  padding: 0 10px;
+}
+
+.preset-input::placeholder {
+  color: #64748b;
+}
+
+.preset-input:focus {
+  border-color: rgb(190 242 100 / 0.6);
+  box-shadow: 0 0 0 3px rgb(190 242 100 / 0.1);
+}
+
+.icon-button {
+  display: inline-flex;
+  width: 36px;
+  height: 36px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgb(190 242 100 / 0.28);
+  border-radius: 8px;
+  background: rgb(190 242 100 / 0.12);
+  color: #d9f99d;
+}
+
+.icon-button:hover {
+  background: rgb(190 242 100 / 0.18);
+}
+
+.template-card {
+  min-height: 176px;
+  border: 1px solid rgb(255 255 255 / 0.1);
+  border-radius: 8px;
+  background: rgb(16 19 24 / 0.92);
+  padding: 14px;
+  color: inherit;
+  box-shadow: 0 18px 48px rgb(0 0 0 / 0.24);
+  transition:
+    border-color 160ms ease,
+    background 160ms ease,
+    transform 160ms ease;
+}
+
+.template-card:hover {
+  border-color: rgb(190 242 100 / 0.36);
+  background: rgb(20 24 30 / 0.96);
+  transform: translateY(-1px);
+}
+
+.template-card:focus-visible {
+  outline: 2px solid rgb(190 242 100 / 0.72);
+  outline-offset: 2px;
+}
+
+.select-shell {
+  position: relative;
+  display: flex;
+  min-height: 40px;
+  align-items: center;
+  border: 1px solid rgb(255 255 255 / 0.1);
+  border-radius: 8px;
+  background: rgb(0 0 0 / 0.24);
+  padding: 0 32px 0 12px;
+}
+
+.select-shell::after {
+  content: "";
+  position: absolute;
+  right: 12px;
+  width: 7px;
+  height: 7px;
+  border-right: 1px solid rgb(203 213 225 / 0.75);
+  border-bottom: 1px solid rgb(203 213 225 / 0.75);
+  transform: rotate(45deg) translateY(-2px);
+  pointer-events: none;
+}
+
+.metric-slider {
+  width: 100%;
+  height: 30px;
+  appearance: none;
+  cursor: pointer;
+  background: transparent;
+}
+
+.metric-slider:focus {
+  outline: none;
+}
+
+.metric-slider::-webkit-slider-runnable-track {
+  height: 8px;
+  border-radius: 999px;
+  background:
+    linear-gradient(90deg, var(--accent), color-mix(in srgb, var(--accent) 28%, #101318))
+      0 / var(--track-fill, 100%) 100% no-repeat,
+    #242933;
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.06);
+}
+
+.metric-slider::-webkit-slider-thumb {
+  width: 20px;
+  height: 20px;
+  margin-top: -6px;
+  appearance: none;
+  border: 3px solid #07080a;
+  border-radius: 999px;
+  background: var(--accent);
+  box-shadow:
+    0 0 0 1px rgb(255 255 255 / 0.18),
+    0 0 22px color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+.metric-slider::-moz-range-track {
+  height: 8px;
+  border-radius: 999px;
+  background: #242933;
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.06);
+}
+
+.metric-slider::-moz-range-progress {
+  height: 8px;
+  border-radius: 999px;
+  background: var(--accent);
+}
+
+.metric-slider::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border: 3px solid #07080a;
+  border-radius: 999px;
+  background: var(--accent);
+  box-shadow:
+    0 0 0 1px rgb(255 255 255 / 0.18),
+    0 0 22px color-mix(in srgb, var(--accent) 55%, transparent);
+}

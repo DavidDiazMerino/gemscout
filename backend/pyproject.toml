@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gemscout-backend"
+version = "0.1.0"
+description = "GemScout — AI football scouting agent powered by Gemini + MongoDB Atlas"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "uvicorn[standard]>=0.30,<1",
+  "motor>=3.4,<4",
+  "pymongo>=4.7,<5",
+  "pydantic>=2.7,<3",
+  "pydantic-settings>=2.2,<3",
+  "voyageai>=0.3,<1",
+  "google-cloud-aiplatform>=1.50,<2",
+  "google-generativeai>=0.8,<1",
+  "httpx>=0.27,<1",
+  "python-dotenv>=1.0,<2",
+  "typer>=0.12,<1",
+]
+
+[project.optional-dependencies]
+migration = [
+  "psycopg[binary]>=3.2,<4",
+]
+dev = [
+  "pytest>=8.2,<9",
+  "pytest-asyncio>=0.23,<1",
+  "ruff>=0.5,<1",
+]
+
+[project.scripts]
+gemscout-migrate = "gemscout.cli.migrate:app"
+gemscout-embed = "gemscout.cli.embed:app"
+gemscout-index = "gemscout.cli.index:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
