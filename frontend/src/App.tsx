@@ -349,7 +349,7 @@ function marketReadingClass(label: string) {
 function radarAccentClass(view: OpportunityView) {
   if (view === 'undervalued') return 'text-emerald-200'
   if (view === 'overvalued') return 'text-rose-200'
-  if (view === 'young-up') return 'text-lime-200'
+  if (view === 'young-up') return 'text-[#2fd6a1]'
   if (view === 'veterans') return 'text-sky-200'
   if (view === 'missing-tm') return 'text-amber-200'
   return 'text-slate-200'
@@ -373,6 +373,51 @@ function loadSavedPresets(): SavedPreset[] {
     }))
   } catch {
     return []
+  }
+}
+
+function normalizePlayerRow(raw: unknown): PlayerRow {
+  // Handle both the new _doc_to_player_row shape and the old raw MongoDB doc shape
+  // Old shape: { score, _id, stats: {xg,...}, current_team, league, metrics_normalized }
+  // New shape: { value, id, xg, goals, ..., team_name, league_name, metrics, metrics_normalized }
+  const p = raw as Partial<PlayerRow> & {
+    score?: number
+    stats?: Record<string, number | null>
+    current_team?: string
+    league?: string
+  }
+  const rawStats = p.stats ?? {}
+  const metrics = (p.metrics as Record<string, number | string | null> | undefined) ?? rawStats ?? {}
+
+  return {
+    id: p.id ?? (p as Record<string, unknown>)._id as string ?? '',
+    name: p.name ?? '',
+    position: p.position ?? null,
+    position_detail: p.position_detail ?? null,
+    age: p.age ?? null,
+    team_name: p.team_name ?? p.current_team ?? null,
+    league_name: p.league_name ?? p.league ?? null,
+    season: p.season ?? '2025-26',
+    value: p.value ?? p.score ?? 0,
+    goals: p.goals ?? (rawStats.goals as number | null) ?? null,
+    assists: p.assists ?? (rawStats.assists as number | null) ?? null,
+    minutes: p.minutes ?? (rawStats.minutes as number | null) ?? null,
+    xg: p.xg ?? (rawStats.xg as number | null) ?? null,
+    xa: p.xa ?? (rawStats.xa as number | null) ?? null,
+    metrics,
+    metrics_normalized: p.metrics_normalized ?? {},
+    stats_source: p.stats_source ?? null,
+    stats_fetched_at: p.stats_fetched_at ?? null,
+    om_value_eur: p.om_value_eur ?? null,
+    tm_value_eur: p.tm_value_eur ?? (p as Record<string, unknown>).market_value_eur as number | null ?? null,
+    tm_value_date: p.tm_value_date ?? null,
+    tm_fetched_at: p.tm_fetched_at ?? null,
+    tm_delta_eur: p.tm_delta_eur ?? null,
+    explanation: p.explanation ?? { summary: '', drivers: [], penalties: [] },
+    confidence_label: p.confidence_label ?? 'Baja',
+    confidence_reasons: p.confidence_reasons ?? [],
+    trend: p.trend ?? { direction: 'insufficient', values_by_season: {}, minutes_by_season: {} },
+    market_reading: p.market_reading ?? { label: 'Sin datos', summary: '', notes: [] },
   }
 }
 
@@ -631,6 +676,10 @@ function App() {
   }, [])
 
   useEffect(() => {
+    if (appMode !== 'explorer') {
+      setIsLoading(false)
+      return
+    }
     const controller = new AbortController()
     const seq = ++requestSeq.current
 
@@ -669,7 +718,7 @@ function App() {
           if (!playersResponse.ok) throw new Error(`GET /players ${playersResponse.status}`)
           const rows = (await playersResponse.json()) as PlayerRow[]
           if (seq === requestSeq.current) {
-            setPlayers(rows)
+            setPlayers(rows.map(normalizePlayerRow))
             setHistoryByPlayerId({})
             setExpandedPlayerId(null)
           }
@@ -714,10 +763,11 @@ function App() {
           throw new Error(`POST /rankings/preview ${previewResponse.status}`)
         }
 
-        const rows = (await previewResponse.json()) as PlayerRow[]
+        const previewData = (await previewResponse.json()) as { players: PlayerRow[] } | PlayerRow[]
+        const rows = Array.isArray(previewData) ? previewData : previewData.players ?? []
         if (seq === requestSeq.current) {
           setTemplateId(null)
-          setPlayers(rows)
+          setPlayers(rows.map(normalizePlayerRow))
           setHistoryByPlayerId({})
           setExpandedPlayerId(null)
         }
@@ -736,6 +786,7 @@ function App() {
       controller.abort()
     }
   }, [
+    appMode,
     apiWeights,
     hasForkedSharedTemplate,
     league,
@@ -880,7 +931,7 @@ function App() {
       const playersResponse = await fetch(playersRequestUrl(template.id))
       if (!playersResponse.ok) throw new Error(`GET /players ${playersResponse.status}`)
       const rows = (await playersResponse.json()) as PlayerRow[]
-      setPlayers(rows)
+      setPlayers(rows.map(normalizePlayerRow))
       setHistoryByPlayerId({})
       setExpandedPlayerId(null)
     } catch (caught) {
@@ -928,7 +979,7 @@ function App() {
               : null,
       }))
     }
-    const trendEntries = Object.entries(player.trend.values_by_season)
+    const trendEntries = Object.entries(player.trend?.values_by_season ?? {})
     if (trendEntries.length > 0) {
       return trendEntries.map(([itemSeason, value]) => ({
         season: itemSeason,
@@ -940,19 +991,19 @@ function App() {
   }
 
   return (
-    <main className="min-h-screen overflow-hidden bg-[#07080a] text-slate-100">
-      <div className="absolute inset-0 -z-0 bg-[radial-gradient(circle_at_25%_10%,rgba(184,255,61,0.12),transparent_26%),radial-gradient(circle_at_85%_18%,rgba(102,224,255,0.1),transparent_22%),linear-gradient(180deg,#0b0d10_0%,#07080a_52%,#050607_100%)]" />
+    <main className="min-h-screen overflow-hidden bg-[#101010] text-[#f2f2f2]">
+      <div className="absolute inset-0 -z-0 bg-[radial-gradient(circle_at_25%_10%,rgba(0,217,146,0.08),transparent_30%),radial-gradient(circle_at_80%_15%,rgba(0,217,146,0.04),transparent_25%),linear-gradient(180deg,#101010_0%,#0d0d0d_100%)]" />
       <div className="relative z-10 mx-auto flex min-h-screen max-w-[1500px] flex-col px-4 py-4 sm:px-6 lg:px-8">
 
         {/* ── Mode switcher ─────────────────────────────────────── */}
-        <div className="mb-4 flex items-center justify-between rounded-2xl border border-white/10 bg-black/30 p-1">
+        <div className="mb-4 flex items-center justify-between rounded-lg border border-[#3d3a39] bg-[#1a1a1a] p-1">
           <button
             type="button"
             onClick={() => setAppMode('scout')}
-            className={`flex flex-1 items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold transition ${
+            className={`flex flex-1 items-center justify-center gap-2 rounded px-4 py-2.5 text-sm font-semibold transition ${
               appMode === 'scout'
-                ? 'bg-lime-500 text-black shadow-lg shadow-lime-500/20'
-                : 'text-slate-400 hover:text-white'
+                ? 'bg-[#00d992] text-[#101010]'
+                : 'text-[#8b949e] hover:text-[#f2f2f2]'
             }`}
           >
             <Sparkles size={15} />
@@ -961,10 +1012,10 @@ function App() {
           <button
             type="button"
             onClick={() => setAppMode('explorer')}
-            className={`flex flex-1 items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold transition ${
+            className={`flex flex-1 items-center justify-center gap-2 rounded px-4 py-2.5 text-sm font-semibold transition ${
               appMode === 'explorer'
-                ? 'bg-white/10 text-white'
-                : 'text-slate-400 hover:text-white'
+                ? 'bg-[#1a1a1a] text-[#f2f2f2] border border-[#3d3a39]'
+                : 'text-[#8b949e] hover:text-[#f2f2f2]'
             }`}
           >
             <SlidersHorizontal size={15} />
@@ -980,7 +1031,7 @@ function App() {
 
         <header className="mb-4 flex flex-col gap-3 border-b border-white/10 pb-4 lg:flex-row lg:items-end lg:justify-between">
           <div>
-            <div className="mb-3 inline-flex items-center gap-2 rounded-full border border-lime-300/20 bg-lime-300/10 px-3 py-1 text-xs font-medium text-lime-200">
+            <div className="mb-3 inline-flex items-center gap-2 rounded-full border border-[#00d992]/20 bg-[#00d992]/10 px-3 py-1 text-xs font-medium text-[#2fd6a1]">
               <CircleDot size={14} />
               GemScout · Player Explorer
             </div>
@@ -1064,7 +1115,7 @@ function App() {
                       {template.description}
                     </p>
                   </div>
-                  <span className="rounded-md border border-white/10 bg-black/30 px-2 py-1 text-xs font-semibold text-lime-200">
+                  <span className="rounded-md border border-white/10 bg-black/30 px-2 py-1 text-xs font-semibold text-[#2fd6a1]">
                     {template.position ?? 'ALL'}
                   </span>
                 </div>
@@ -1093,7 +1144,7 @@ function App() {
                 {publicTemplates.map((template) => (
                   <button
                     key={template.id}
-                    className="min-w-56 rounded-lg border border-white/10 bg-white/[0.035] px-3 py-2 text-left text-sm transition hover:border-lime-300/30 hover:bg-white/[0.06]"
+                    className="min-w-56 rounded-lg border border-white/10 bg-white/[0.035] px-3 py-2 text-left text-sm transition hover:border-[#00d992]/30 hover:bg-white/[0.06]"
                     type="button"
                     onClick={() => void loadPublicTemplate(template.id, template.name)}
                   >
@@ -1109,12 +1160,12 @@ function App() {
         </section>
 
         <div className="grid flex-1 gap-4 lg:grid-cols-[390px_minmax(0,1fr)]">
-          <aside className="rounded-lg border border-white/10 bg-[#101318]/95 p-4 shadow-2xl shadow-black/30">
+          <aside className="rounded-lg border border-[#3d3a39] bg-[#1a1a1a] p-4">
             <div className="mb-5 flex items-center justify-between">
               <div>
                 <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Modelo</p>
                 <h2 className="mt-1 flex items-center gap-2 text-xl font-semibold text-white">
-                  <SlidersHorizontal size={20} className="text-lime-300" />
+                  <SlidersHorizontal size={20} className="text-[#00d992]" />
                   Pesos
                 </h2>
               </div>
@@ -1193,12 +1244,12 @@ function App() {
             </div>
           </aside>
 
-          <section className="min-w-0 rounded-lg border border-white/10 bg-[#0d1015]/95 shadow-2xl shadow-black/30">
+          <section className="min-w-0 rounded-lg border border-[#3d3a39] bg-[#101010]">
             <div className="flex flex-col gap-3 border-b border-white/10 p-4 sm:flex-row sm:items-center sm:justify-between">
               <div className="min-w-0">
                 <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Top 50</p>
                 <h2 className="mt-1 flex items-center gap-2 text-xl font-semibold text-white">
-                  <Trophy size={20} className="text-lime-300" />
+                  <Trophy size={20} className="text-[#00d992]" />
                   Jugadores por valor calculado
                 </h2>
               </div>
@@ -1240,7 +1291,7 @@ function App() {
                         key={lane.view}
                         className={`shrink-0 rounded-md border px-2.5 py-1.5 text-xs font-semibold ${
                           opportunityView === lane.view
-                            ? 'border-lime-300/50 bg-lime-300/15 text-lime-100'
+                            ? 'border-[#00d992]/50 bg-[#00d992]/15 text-[#00d992]'
                             : 'border-white/10 bg-white/[0.025] text-slate-400 hover:text-slate-100'
                         }`}
                         type="button"
@@ -1277,7 +1328,7 @@ function App() {
                     size={16}
                   />
                   <input
-                    className="w-full rounded-md border border-white/10 bg-black/25 py-2 pl-9 pr-3 text-sm text-white outline-none transition focus:border-lime-300/50"
+                    className="w-full rounded-md border border-white/10 bg-black/25 py-2 pl-9 pr-3 text-sm text-white outline-none transition focus:border-[#00d992]/50"
                     placeholder="Buscar jugador, club o liga"
                     value={playerSearch}
                     onChange={(event) => {
@@ -1299,7 +1350,7 @@ function App() {
                       key={value}
                       className={`rounded-md border px-3 py-1.5 text-xs font-semibold ${
                         opportunityView === value
-                          ? 'border-lime-300/50 bg-lime-300/15 text-lime-100'
+                          ? 'border-[#00d992]/50 bg-[#00d992]/15 text-[#00d992]'
                           : 'border-white/10 bg-white/[0.035] text-slate-400 hover:text-slate-100'
                       }`}
                       type="button"
@@ -1356,7 +1407,7 @@ function App() {
                         <td className="px-4 py-3 text-slate-500">{index + 1}</td>
                         <td className="px-4 py-3">
                           <button
-                            className="text-left font-medium text-white hover:text-lime-200"
+                            className="text-left font-medium text-white hover:text-[#2fd6a1]"
                             type="button"
                             onClick={() => openPlayer(player)}
                           >
@@ -1386,7 +1437,7 @@ function App() {
                             <button
                               className={`rounded border px-1.5 py-0.5 ${
                                 compareIds.includes(player.id)
-                                  ? 'border-lime-300/50 bg-lime-300/15 text-lime-100'
+                                  ? 'border-[#00d992]/50 bg-[#00d992]/15 text-[#00d992]'
                                   : 'border-white/10 bg-white/[0.035] text-slate-300 hover:text-white'
                               }`}
                               type="button"
@@ -1399,7 +1450,7 @@ function App() {
                         <td className="px-4 py-3">{player.team_name ?? '-'}</td>
                         <td className="px-4 py-3">{player.league_name ?? '-'}</td>
                         <td className="px-4 py-3 text-right">
-                          <span className="inline-flex min-w-16 justify-center rounded-md bg-lime-300 px-2 py-1 text-xs font-bold text-black">
+                          <span className="inline-flex min-w-16 justify-center rounded bg-[#00d992] px-2 py-1 text-xs font-bold text-[#101010]">
                             {formatNumber(player.value, 2)}
                           </span>
                         </td>
@@ -1456,7 +1507,7 @@ function App() {
                                   {player.explanation.drivers.map((driver) => (
                                     <span
                                       key={driver.metric}
-                                      className="rounded-md border border-lime-300/20 bg-lime-300/10 px-2 py-1 text-xs text-lime-100"
+                                      className="rounded-md border border-[#00d992]/20 bg-[#00d992]/10 px-2 py-1 text-xs text-[#00d992]"
                                     >
                                       {driver.label} p{Math.round(driver.percentile)}
                                     </span>
@@ -1590,7 +1641,7 @@ function App() {
                 Cancelar
               </button>
               <button
-                className="rounded-md border border-lime-300/40 bg-lime-300 px-3 py-2 text-sm font-semibold text-black"
+                className="rounded-md border border-[#00d992]/40 bg-[#00d992] px-3 py-2 text-sm font-semibold text-black"
                 type="button"
                 onClick={shareTemplate}
               >
@@ -1635,7 +1686,7 @@ function SummaryTile({
 }) {
   return (
     <div className="rounded-lg border border-white/10 bg-white/[0.035] p-3">
-      <div className="mb-2 text-lime-300">{icon}</div>
+      <div className="mb-2 text-[#00d992]">{icon}</div>
       <p className="text-xs text-slate-500">{label}</p>
       <p className="mt-1 text-lg font-semibold text-white">{value}</p>
     </div>
@@ -1716,7 +1767,7 @@ function ComparePanel({
     <div className="border-b border-white/10 bg-black/15 p-3">
       <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex items-center gap-2">
-          <Scale size={16} className="text-lime-300" />
+          <Scale size={16} className="text-[#00d992]" />
           <div>
             <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Comparador</p>
             <h3 className="text-sm font-semibold text-white">{players.length}/4 jugadores</h3>
@@ -1743,7 +1794,7 @@ function ComparePanel({
                   type="button"
                   onClick={() => onOpen(player)}
                 >
-                  <p className="truncate text-sm font-semibold text-white hover:text-lime-200">
+                  <p className="truncate text-sm font-semibold text-white hover:text-[#2fd6a1]">
                     {player.name}
                   </p>
                   <p className="truncate text-xs text-slate-500">{player.team_name ?? '-'}</p>

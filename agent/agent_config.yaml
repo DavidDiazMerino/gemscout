@@ -9,8 +9,8 @@ description: |
 
 defaultLanguageCode: en
 
-# Gemini model — Flash for speed, Pro for deeper analysis
-model: gemini-2.0-flash-001
+# Gemini 2.5 Flash — best for agents (2.0 Flash is legacy-only for new accounts as of Mar 2026)
+model: gemini-2.5-flash
 
 # System instruction — the agent's persona and behaviour
 systemInstruction: |
@@ -44,7 +44,7 @@ tools:
       # This points to your deployed FastAPI backend
       # Replace with your Cloud Run URL after deployment
       servers:
-        - url: "https://gemscout-backend-HASH-uc.a.run.app"
+        - url: "https://gemscout-backend-377689698254.europe-west3.run.app"
       openapi: "3.0.0"
       info:
         title: "GemScout Scout Tool"

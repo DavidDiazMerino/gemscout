@@ -4,26 +4,30 @@
 
 **Find the hidden gems before anyone else.**
 
-GemScout is a World Cup 2026 scouting agent that helps national team directors discover underrated players in non-European leagues using semantic search, tactical AI, and real statistical data.
+GemScout is a World Cup 2026 scouting agent that helps national team directors discover underrated players using semantic search, 3-season trend analysis, and Gemini-generated tactical dossiers.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-lime.svg)](LICENSE)
-[![Built with Gemini](https://img.shields.io/badge/Built%20with-Gemini%202.0%20Flash-blue)](https://cloud.google.com/vertex-ai)
-[![MongoDB Atlas](https://img.shields.io/badge/Data-MongoDB%20Atlas-green)](https://www.mongodb.com/atlas)
+[![Built with Gemini 2.5 Flash](https://img.shields.io/badge/Built%20with-Gemini%202.5%20Flash-blue)](https://cloud.google.com/vertex-ai)
+[![MongoDB Atlas Vector Search](https://img.shields.io/badge/Data-MongoDB%20Atlas%20Vector%20Search-green)](https://www.mongodb.com/atlas)
 
 ---
 
 ## The Problem
 
-A national team director preparing for the 2026 World Cup needs to scout uncapped or underrated players from non-top-5-league nations. Traditional scouting takes months. 2,200+ players, dozens of metrics — how do you find the 24-year-old pressing forward from Liga MX who plays like Bellingham but nobody's heard of yet?
+A national team director preparing for the 2026 World Cup faces an impossible task: manually scouting 2,200+ players across 20+ leagues, comparing tactical profiles and statistical trajectories, all before the transfer window closes.
+
+GemScout solves this in seconds.
 
 ## The Solution
 
-GemScout translates natural language scouting requests into:
-1. **Voyage AI embeddings** → **MongoDB Atlas Vector Search** (semantic tactical match)
-2. **Statistical cross-filtering** (age, league, position, percentile thresholds)
-3. **Gemini 2.0 Flash** generates a full scouting dossier per player
+A single natural language query like *"box-to-box midfielder, under 24, high pressing, World Cup ready"* triggers a 4-step agent pipeline:
 
-All orchestrated by **Google Cloud Agent Builder**.
+1. **Voyage AI `voyage-3-large`** embeds the query into a 1536-dim tactical vector
+2. **MongoDB Atlas Vector Search** (cosine similarity) retrieves the semantically closest players from 2,200+ tactical profiles
+3. **Quantitative cross-filter** validates candidates against hard constraints (age, position, league tier)
+4. **Gemini 2.5 Flash** (Vertex AI) generates a structured scouting dossier with WC cycle trend analysis
+
+All orchestrated by **Google Cloud Agent Builder** via OpenAPI tool integration.
 
 ---
 
@@ -33,24 +37,30 @@ All orchestrated by **Google Cloud Agent Builder**.
 User (natural language query)
         │
         ▼
-Google Cloud Agent Builder (Gemini 2.0 Flash)
-        │ calls tool
+Google Cloud Agent Builder  ──── agent/agent_config.yaml
+        │  (OpenAPI tool call)
         ▼
-FastAPI Backend (Cloud Run)
+FastAPI Backend  ──────────────── Cloud Run (europe-west3)
         │
-        ├─► Voyage AI: embed query → 1024-dim vector
+        ├─► Voyage AI voyage-3-large
+        │   embed query → 1536-dim vector
         │
         ├─► MongoDB Atlas Vector Search
-        │   (player_embedding_index, cosine similarity)
-        │   Pre-filters: season, position, age, league_tier
+        │   index: player_embedding_index
+        │   cosine similarity · 200 candidates
+        │   post-filter: season / position / age / league_tier
         │
-        ├─► MongoDB MCP Server
-        │   (direct agent ↔ Atlas communication)
+        ├─► MongoDB quantitative filter
+        │   sort by position-specific percentile stat
+        │   merge with semantic results
         │
-        └─► Gemini 2.0 Flash: generate scouting report
+        └─► Gemini 2.5 Flash (Vertex AI REST API)
+            prompt: top-3 profiles + 3-season WC cycle data
+            output: structured scouting dossier
                 │
                 ▼
-        Scouting Report + Reasoning Steps → React UI
+        React + TypeScript UI
+        reasoning trace · player cards · Gemini dossier
 ```
 
 ---
@@ -59,10 +69,11 @@ FastAPI Backend (Cloud Run)
 
 | Component | Usage |
 |-----------|-------|
-| **MongoDB Atlas** | Primary data store — 2,200+ player documents with stats, percentile scores |
-| **Atlas Vector Search** | Semantic similarity search on Voyage AI embeddings (1024-dim, cosine) |
-| **Atlas Search** | Full-text player name and team search |
-| **MongoDB MCP Server** | Gives the Google Cloud Agent direct database access via Model Context Protocol |
+| **MongoDB Atlas** | Primary store — 2,200+ player documents with stats, percentile scores, Voyage AI embeddings |
+| **Atlas Vector Search** | Core feature — `$vectorSearch` aggregation stage over 1536-dim embeddings, cosine similarity, pre-filter by position/age/season |
+| **Atlas (quantitative)** | Secondary filter pass — sort by `metrics_normalized.{key}` for position-aware stat ranking |
+
+Agent Builder connects to MongoDB via a FastAPI backend tool (OpenAPI spec in `agent/agent_config.yaml`).
 
 ---
 
@@ -71,23 +82,24 @@ FastAPI Backend (Cloud Run)
 | Layer | Technology |
 |-------|-----------|
 | Agent Orchestration | Google Cloud Agent Builder |
-| LLM | Gemini 2.0 Flash (`gemini-2.0-flash-001`) |
-| Embeddings | Voyage AI (`voyage-3-large`, 1024-dim) |
-| Database | MongoDB Atlas (migrated from PostgreSQL) |
-| Vector Search | MongoDB Atlas Vector Search |
-| Backend | FastAPI (Python 3.12) |
-| Frontend | React 19 + TypeScript + Tailwind CSS |
-| Deployment | Cloud Run (backend) + Firebase Hosting (frontend) |
+| LLM | Gemini 2.5 Flash (`gemini-2.5-flash`, Vertex AI REST) |
+| Embeddings | Voyage AI (`voyage-3-large`, 1536-dim) |
+| Database | MongoDB Atlas |
+| Vector Search | MongoDB Atlas Vector Search (`$vectorSearch`) |
+| Backend | FastAPI + Motor (async MongoDB, Python 3.12) |
+| Frontend | React 19 + TypeScript + Tailwind CSS v4 |
+| Deployment | Cloud Run (backend) · Vite dev server (frontend demo) |
 
 ---
 
 ## Data
 
 - **2,200+ players** across Big-5 Europe, Brasileirão, Liga MX, MLS, and 15+ leagues
-- **Stats**: xG, xA, goals, assists, key passes, xG chain, xG buildup, minutes, shots + goalkeeper metrics
+- **Current season**: 2025-26 (team + stats from SofaScore / FBRef)
+- **Historical**: 2024-25 and 2023-24 in `history.{season}` subdocuments — enables 3-season WC cycle trend analysis
+- **Stats**: xG, xA, goals, assists, key passes, xG chain, xG buildup, minutes, shots + goalkeeper-specific metrics
 - **Percentile normalization** within position groups (FWD/MID/DEF/GK)
-- **Voyage AI embeddings** of rich tactical player profiles
-- **Wikidata QID** as canonical player identity anchor
+- **Voyage AI embeddings** of rich tactical player profiles (`profile_text`)
 
 ---
 
@@ -97,10 +109,9 @@ FastAPI Backend (Cloud Run)
 
 - Python 3.12+
 - Node 22+
-- MongoDB Atlas account (M10+ cluster for Vector Search)
+- MongoDB Atlas M10+ cluster (Vector Search requires M10 or higher)
 - Voyage AI API key ([voyageai.com](https://voyageai.com))
 - Google Cloud project with Vertex AI enabled
-- Gemini API key
 
 ### 1. Clone & configure
 
@@ -108,39 +119,37 @@ FastAPI Backend (Cloud Run)
 git clone https://github.com/DavidDiazMerino/Gemscout
 cd Gemscout
 cp .env.example .env
-# Edit .env with your API keys
+# Edit .env with your credentials
 ```
 
 ### 2. Migrate data to MongoDB
 
 ```bash
-cd backend
-pip install -e ".[migration]"
-# From your existing OpenMercat PostgreSQL:
-python ../scripts/migrate_to_mongodb.py --season 2025-26
+cd backend && pip install -e ".[migration]"
+python ../scripts/migrate_to_mongodb.py
+python ../scripts/migrate_history.py   # 2023-24 + 2024-25 historical seasons
 ```
 
-### 3. Generate embeddings
+### 3. Generate Voyage AI embeddings
 
 ```bash
-python ../scripts/generate_embeddings.py --season 2025-26
+python ../scripts/generate_embeddings.py
 ```
 
-### 4. Create Atlas indexes
+### 4. Create Atlas Vector Search index
 
-```bash
-python ../scripts/setup_atlas_indexes.py --print-only
-# Copy the JSON definition and create the index in Atlas UI
-```
+In Atlas UI → Search Indexes → Create: use `player_embedding_index` on the `players` collection, field `embedding`, dimensions 1536, cosine similarity.
 
 ### 5. Run locally
 
 ```bash
 # Backend
-cd backend && pip install -e . && uvicorn gemscout.api.main:app --reload --port 8080
+cd backend && pip install -e .
+uvicorn gemscout.api.main:app --reload --port 8080
 
 # Frontend (separate terminal)
-cd frontend && npm install && npm run dev
+cd frontend && npm install
+VITE_API_TARGET=http://localhost:8080 npm run dev
 ```
 
 Open http://localhost:5173
@@ -150,8 +159,9 @@ Open http://localhost:5173
 ```bash
 gcloud run deploy gemscout-backend \
   --source ./backend \
-  --region us-central1 \
-  --set-env-vars="MONGODB_URI=...,VOYAGE_API_KEY=...,GEMINI_API_KEY=..."
+  --region europe-west3 \
+  --allow-unauthenticated \
+  --set-env-vars="MONGODB_URI=...,VOYAGE_API_KEY=...,GOOGLE_CLOUD_PROJECT=..."
 ```
 
 ---
@@ -159,44 +169,19 @@ gcloud run deploy gemscout-backend \
 ## Google Cloud Agent Builder Setup
 
 1. Go to [Vertex AI Agent Builder](https://cloud.google.com/agent-builder) in GCP Console
-2. Create new agent → paste content from `agent/agent_config.yaml`
-3. Add OpenAPI tool pointing to your Cloud Run URL
+2. Create new agent
+3. Add an OpenAPI tool — use the spec from `agent/agent_config.yaml` (points to the Cloud Run URL)
 4. Test with: *"Find me a box-to-box midfielder, under 24, from Americas leagues, World Cup potential"*
 
 ---
 
-## MongoDB MCP Server
+## Example Queries
 
-Configure in Claude Desktop or any MCP-compatible client:
-
-```json
-{
-  "mcpServers": {
-    "mongodb": {
-      "command": "npx",
-      "args": ["-y", "@mongodb-js/mongodb-mcp-server@latest"],
-      "env": {
-        "MDB_MCP_CONNECTION_STRING": "your-atlas-uri"
-      }
-    }
-  }
-}
-```
-
----
-
-## Demo
-
-[▶ Watch 3-minute demo](demo/gemscout-demo.mp4)
-
-**Live demo:** https://gemscout.run.app
-
-### Example queries
-
-- *"Find me a box-to-box midfielder, under 24, from Americas leagues, high pressing, World Cup ready"*
-- *"Striker from Brasileirão or Liga MX, top 15% xG, under 25, flying under the radar"*
-- *"Who's the best false 9 in non-European leagues right now?"*
-- *"Defensive midfielder with elite build-up play, under 23, South American league"*
+- *"Box-to-box midfielder, under 24, high pressing intensity and strong ball progression, World Cup 2026 potential"*
+- *"Elite goalkeeper for World Cup 2026 — commanding aerial presence, quick distribution, top-tier shot-stopping"*
+- *"High-intensity pressing forward, under 23, similar to Gnabry — explosive, goals and assists"*
+- *"Creative attacking midfielder in La Liga, under 26, elite chance creation"*
+- *"South American midfielder playing in Europe, under 25, undervalued by Transfermarkt"*
 
 ---
 
@@ -204,23 +189,22 @@ Configure in Claude Desktop or any MCP-compatible client:
 
 ```
 gemscout/
-├── agent/               # Google Cloud Agent Builder config + OpenAPI tool spec
-├── backend/             # FastAPI backend (Python 3.12)
+├── agent/                    # Google Cloud Agent Builder config + OpenAPI spec
+│   └── agent_config.yaml
+├── backend/
 │   └── src/gemscout/
-│       ├── api/         # FastAPI routes (/players, /rankings, /agent/scout)
-│       ├── db/          # MongoDB async client (motor)
-│       ├── embeddings/  # Voyage AI embedding generation
-│       ├── agent/       # Agent tools (semantic search, filter, scouting report)
-│       └── valuation/   # Percentile normalization (adapted from OpenMercat)
-├── frontend/            # React 19 + TypeScript + Tailwind CSS
+│       ├── api/main.py       # FastAPI routes — /agent/scout orchestration
+│       ├── agent/tools.py    # semantic_player_search, filter_players, build_scouting_prompt
+│       ├── db/               # MongoDB async client (Motor)
+│       └── embeddings/       # Voyage AI embedding generation
+├── frontend/
 │   └── src/
-│       ├── App.tsx      # Main app with Scout + Explorer modes
-│       └── ScoutMode.tsx  # GemScout agent UI (NL query + reasoning + report)
-├── scripts/             # Data pipeline
-│   ├── migrate_to_mongodb.py   # PostgreSQL → MongoDB migration
-│   ├── generate_embeddings.py  # Voyage AI embedding generation
-│   └── setup_atlas_indexes.py  # Atlas Vector Search index setup
-└── mcp/                 # MongoDB MCP server configuration
+│       ├── App.tsx           # Explorer mode (rankings, trend charts)
+│       └── ScoutMode.tsx     # Scout mode (NL query → reasoning trace → dossier)
+└── scripts/
+    ├── migrate_to_mongodb.py    # PostgreSQL → MongoDB migration
+    ├── migrate_history.py       # 2023-24 / 2024-25 historical seasons
+    └── generate_embeddings.py   # Voyage AI embedding generation
 ```
 
 ---
@@ -229,7 +213,7 @@ gemscout/
 
 Built on top of [OpenMercat](https://github.com/DavidDiazMerino/openmercat) — an open football analytics platform.
 
-Data sources: Understat · SofaScore · FBRef · Transfermarkt · Wikidata
+Data sources: SofaScore · FBRef · Transfermarkt · Wikidata
 
 ---
 

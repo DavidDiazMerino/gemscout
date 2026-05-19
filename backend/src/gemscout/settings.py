@@ -12,8 +12,8 @@ class Settings(BaseSettings):
     google_cloud_project: str = ""
     google_cloud_location: str = "us-central1"
     gemini_api_key: str = ""
-    # Model to use for scouting reports — default to Flash for speed/cost
-    gemini_model: str = "gemini-2.0-flash-001"
+    # Model name shown in the UI (actual REST call in _gemini_rest hardcodes gemini-2.5-flash)
+    gemini_model: str = "gemini-2.5-flash"
 
     backend_host: str = "0.0.0.0"
     backend_port: int = 8080

@@ -74,7 +74,7 @@ def migrate(
 
     rows = pg_conn.execute(
         """
-        SELECT
+        SELECT DISTINCT ON (p.qid_wikidata)
           p.qid_wikidata                          AS qid,
           p.name,
           EXTRACT(YEAR FROM AGE(p.birth_date))::int AS age,
@@ -97,18 +97,18 @@ def migrate(
           p.id_understat,
           p.id_sofascore
         FROM players p
-        JOIN player_stats ps ON ps.player_id = p.id
-        LEFT JOIN teams t    ON t.id = p.current_team_id
-        LEFT JOIN leagues l  ON l.id = t.current_league_id
+        JOIN player_stats ps   ON ps.player_id = p.id
+        LEFT JOIN teams t      ON t.id = p.current_team_id
+        LEFT JOIN leagues l    ON l.id = COALESCE(ps.league_id, p.current_league_id, t.current_league_id)
         LEFT JOIN LATERAL (
           SELECT value_eur FROM player_valuations
           WHERE player_id = p.id
-          ORDER BY snapshot_date DESC
+          ORDER BY date DESC
           LIMIT 1
         ) pv ON TRUE
         WHERE ps.season = %s
           AND p.qid_wikidata IS NOT NULL
-        ORDER BY p.qid_wikidata
+        ORDER BY p.qid_wikidata, ps.fetched_at DESC
         """,
         (season,),
     ).fetchall()
