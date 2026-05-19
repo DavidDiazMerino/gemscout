@@ -39,13 +39,28 @@ function spawnMcpServer() {
   return proc;
 }
 
-// ─── Session map: sessionId → { proc, sseRes, pendingCallbacks } ─────────────
+// ─── Session map: sessionId → { proc, sseRes, pending } ─────────────────────
 
 const sessions = new Map();
 
+// ─── Send a JSON-RPC request to the child and wait for its response ───────────
+
+function rpcToChild(proc, pending, id, method, params = {}) {
+  return new Promise((resolve, reject) => {
+    pending.set(id, resolve);
+    proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+    setTimeout(() => {
+      if (pending.has(id)) {
+        pending.delete(id);
+        reject(new Error(`rpcToChild timeout: ${method}`));
+      }
+    }, 15000);
+  });
+}
+
 // ─── SSE endpoint — Agent Builder opens a persistent connection here ─────────
 
-app.get("/sse", (req, res) => {
+app.get("/sse", async (req, res) => {
   const sessionId = randomUUID();
 
   res.setHeader("Content-Type", "text/event-stream");
@@ -55,30 +70,34 @@ app.get("/sse", (req, res) => {
   res.flushHeaders();
 
   const proc = spawnMcpServer();
-  const pending = new Map(); // id → resolve
+  const pending = new Map(); // id → resolve fn
 
   sessions.set(sessionId, { proc, sseRes: res, pending });
 
-  // Forward MCP server stdout → SSE to client
+  // Forward MCP server stdout → SSE to client (and resolve pending calls)
   let buffer = "";
   proc.stdout.on("data", (chunk) => {
     buffer += chunk.toString();
     const lines = buffer.split("\n");
-    buffer = lines.pop(); // keep incomplete line
+    buffer = lines.pop();
     for (const line of lines) {
       if (!line.trim()) continue;
       try {
         const msg = JSON.parse(line);
-        // MCP notifications or responses
+        // Resolve internal pending calls (prefixed "__") without forwarding to client
+        if (typeof msg.id === "string" && msg.id.startsWith("__")) {
+          if (pending.has(msg.id)) {
+            pending.get(msg.id)(msg);
+            pending.delete(msg.id);
+          }
+          continue; // don't forward internal responses (may contain credentials)
+        }
         res.write(`data: ${JSON.stringify(msg)}\n\n`);
-        // Resolve pending RPC call
         if (msg.id != null && pending.has(msg.id)) {
           pending.get(msg.id)(msg);
           pending.delete(msg.id);
         }
-      } catch {
-        // ignore non-JSON lines (e.g. startup log)
-      }
+      } catch { /* ignore non-JSON startup logs */ }
     }
   });
 
@@ -92,8 +111,22 @@ app.get("/sse", (req, res) => {
     sessions.delete(sessionId);
   });
 
-  // Send endpoint info so client knows where to POST messages
-  res.write(`event: endpoint\ndata: ${JSON.stringify({ sessionId, messageUrl: `/message?sessionId=${sessionId}` })}\n\n`);
+  // Auto-connect to MongoDB using server-side credentials — keeps URI out of prompts
+  try {
+    await rpcToChild(proc, pending, "__init_connect__", "tools/call", {
+      name: "connect",
+      arguments: { connectionStringOrClusterName: MDB_URI },
+    });
+    console.log(`[${sessionId}] Auto-connected to MongoDB`);
+  } catch (err) {
+    console.error(`[${sessionId}] Auto-connect failed:`, err.message);
+  }
+
+  // Send endpoint info so client knows where to POST messages (absolute URL required)
+  const host = req.headers["x-forwarded-host"] || req.headers.host || `localhost:${PORT}`;
+  const proto = req.headers["x-forwarded-proto"] || "https";
+  const base = `${proto}://${host}`;
+  res.write(`event: endpoint\ndata: ${JSON.stringify({ sessionId, messageUrl: `${base}/message?sessionId=${sessionId}` })}\n\n`);
 });
 
 // ─── Message endpoint — Agent Builder posts JSON-RPC here ───────────────────
