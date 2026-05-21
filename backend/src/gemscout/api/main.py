@@ -7,10 +7,13 @@ that power the Google Cloud Agent Builder integration.
 
 from __future__ import annotations
 
+import json as _json
 import logging
 from collections import defaultdict, deque
 from time import monotonic, perf_counter
 from typing import Any
+
+import httpx
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -498,33 +501,215 @@ def _check_rate_limit(client_ip: str) -> None:
     hits.append(now)
 
 
+# ── ADK Agent integration ────────────────────────────────────────────────────
+# The main scouting flow routes through the ADK agent (Gemini 2.5 Flash)
+# which uses the official @mongodb-js/mongodb-mcp-server partner MCP server
+# to query MongoDB Atlas. This is the real product flow for the hackathon.
+
+ADK_AGENT_BASE = "https://gemscout-agent-377689698254.europe-west3.run.app"
+
+
+async def _call_adk_scout(
+    query: str,
+    position: str | None,
+    max_age: int | None,
+    min_age: int | None,
+    league_slug: str | None,
+    league_tier_max: int | None,
+    debug_mode: bool,
+) -> "ScoutResponse":
+    """
+    Calls the GemScout ADK agent on Cloud Run.
+    The agent uses MCP (official @mongodb-js/mongodb-mcp-server) to search
+    MongoDB Atlas and Gemini 2.5 Flash to write the scouting report.
+
+    Returns a ScoutResponse with players (from MCP tool responses),
+    scouting_report (from Gemini), and tool_calls (the MCP calls made).
+    """
+    # Build a natural-language message that includes any structured filters
+    # so the agent embeds them in the compound.$search pipeline.
+    parts = [query.strip()]
+    if position:
+        parts.append(f"Position filter: {position}.")
+    if max_age:
+        parts.append(f"Max age: {max_age}.")
+    if min_age:
+        parts.append(f"Min age: {min_age}.")
+    if league_slug:
+        parts.append(f"League: {league_slug}.")
+    if league_tier_max:
+        parts.append(f"Max league tier: {league_tier_max} (1=Big-5, 2=Strong EU, 3=Americas).")
+    user_message = " ".join(parts)
+
+    async with httpx.AsyncClient(timeout=90.0) as client:
+        # 1. Create a throwaway session for this request
+        sess = await client.post(
+            f"{ADK_AGENT_BASE}/apps/gemscout_agent/users/gemscout/sessions",
+            json={},
+        )
+        sess.raise_for_status()
+        session_id = sess.json()["id"]
+
+        # 2. Run the agent — Gemini orchestrates MCP tool calls
+        run = await client.post(
+            f"{ADK_AGENT_BASE}/run",
+            json={
+                "app_name": "gemscout_agent",
+                "user_id": "gemscout",
+                "session_id": session_id,
+                "new_message": {
+                    "role": "user",
+                    "parts": [{"text": user_message}],
+                },
+            },
+        )
+        run.raise_for_status()
+        events: list[dict] = run.json()
+
+    # 3. Parse ADK events into our ScoutResponse format
+    reasoning: list[ReasoningStep] = []
+    tool_calls_list: list[str] = []
+    players_raw: list[dict] = []
+    scouting_report = ""
+    step = 0
+    seen_qids: set[str] = set()
+
+    for event in events:
+        author = event.get("author", "")
+        for part in event.get("content", {}).get("parts", []):
+
+            if "functionCall" in part:
+                fc = part["functionCall"]
+                step += 1
+                tool_calls_list.append(fc["name"])
+                args_preview = _json.dumps(fc.get("args", {}))[:300]
+                reasoning.append(ReasoningStep(
+                    step=step,
+                    action=f"mcp:{fc['name']}",
+                    detail=f"MCP tool call → {fc['name']}({args_preview})",
+                ))
+
+            elif "functionResponse" in part:
+                resp_data = part["functionResponse"]
+                tool_name = resp_data.get("name", "")
+                content_items = resp_data.get("response", {}).get("content", [])
+                summary = ""
+                for item in content_items:
+                    text = item.get("text", "")
+                    if not text:
+                        continue
+                    if text.startswith("{") and '"name"' in text:
+                        # Each document comes as a separate JSON string
+                        try:
+                            doc = _json.loads(text)
+                            qid = doc.get("_id") or doc.get("qid", "")
+                            if qid and qid not in seen_qids:
+                                seen_qids.add(qid)
+                                players_raw.append(doc)
+                        except Exception:
+                            pass
+                    elif text.startswith("Found"):
+                        summary = text
+                if reasoning and summary:
+                    reasoning[-1].result_summary = summary
+
+            elif "text" in part and author == "gemscout":
+                scouting_report += part["text"]
+
+    # 4. Convert raw MongoDB docs → player dicts using existing helpers
+    players_out: list[dict] = []
+    for doc in players_raw:
+        qid = doc.get("_id") or doc.get("qid", "")
+        norm = doc.get("metrics_normalized") or {}
+        position_doc = doc.get("position", "")
+        history = doc.get("history") or {}
+        stats = doc.get("stats") or {}
+        season_doc = doc.get("season", "2025-26")
+
+        trend = _compute_trend(
+            _position_score(norm, position_doc),
+            season_doc,
+            history,
+            position_doc,
+            stats.get("minutes"),
+        )
+        players_out.append({
+            "id": qid,
+            "name": doc.get("name", ""),
+            "age": doc.get("age", 0),
+            "position": position_doc,
+            "nationality": doc.get("nationality", ""),
+            "current_team": doc.get("current_team", ""),
+            "league": doc.get("league", ""),
+            "league_tier": doc.get("league_tier", 0),
+            "season": season_doc,
+            "stats": stats,
+            "metrics_normalized": norm,
+            "market_value_eur": doc.get("market_value_eur"),
+            "vector_score": None,
+            "profile_text": doc.get("profile_text", ""),
+            "trend": trend,
+        })
+
+    debug_info = None
+    if debug_mode:
+        debug_info = DebugInfo(
+            query_intent={"mode": "ADK agent + MCP", "user_message": user_message},
+            filters_applied={"position": position, "max_age": max_age, "league_slug": league_slug},
+            semantic_candidates=[{"name": p["name"], "team": p["current_team"], "league": p["league"], "age": p["age"], "position": p["position"], "vector_score": 0} for p in players_out],
+            quant_candidates_count=0,
+            final_ranking=[{"name": p["name"], "team": p["current_team"], "vector_score": 0, "stat_score": 0, "combined_score": 0} for p in players_out],
+            timing_ms={"adk_agent": -1},
+            vector_index="player_text_index (Atlas Search via MCP)",
+            embedding_model="none — MCP $search on profile_text",
+            llm_model="gemini-2.5-flash (ADK agent)",
+        )
+
+    return ScoutResponse(
+        query=query,
+        reasoning_steps=reasoning,
+        players=players_out[:5],
+        scouting_report=scouting_report,
+        tool_calls=tool_calls_list,
+        debug_info=debug_info,
+    )
+
+
 @app.post("/agent/scout", response_model=ScoutResponse)
 async def agent_scout(body: ScoutRequest, request: Request):
     """
-    Main GemScout agent endpoint.
+    Main GemScout scouting endpoint.
 
-    Orchestrates:
-    1. Semantic vector search (Voyage AI embeddings + MongoDB Atlas)
-    2. Quantitative cross-filtering
-    3. Gemini scouting report generation
-
-    This endpoint is consumed by:
-    - The React frontend (direct API call)
-    - Google Cloud Agent Builder (as a registered tool)
+    Routes through the ADK agent (Gemini 2.5 Flash) which uses the official
+    @mongodb-js/mongodb-mcp-server partner MCP server to query MongoDB Atlas.
+    All MongoDB operations go through the partner MCP server.
     """
     client_ip = request.client.host if request.client else "unknown"
     _check_rate_limit(client_ip)
 
-    # Parse query intent to fill in any missing structured filters
     intent = _parse_query_intent(body.query)
     position = body.position or intent.get("position")
     max_age = body.max_age if body.max_age is not None else intent.get("max_age")
     min_age = body.min_age
     league_tier_max = body.league_tier_max if body.league_tier_max is not None else intent.get("league_tier_max")
-    league_tier_min = body.league_tier_min if body.league_tier_min is not None else intent.get("league_tier_min")
     league_slug = body.league_slug or intent.get("league_slug")
-    americas_requested = intent.get("americas_requested", False)
 
+    try:
+        return await _call_adk_scout(
+            query=body.query,
+            position=position,
+            max_age=max_age,
+            min_age=min_age,
+            league_slug=league_slug,
+            league_tier_max=league_tier_max,
+            debug_mode=body.debug_mode,
+        )
+    except Exception as exc:
+        logger.error("ADK agent call failed: %s", exc)
+        raise HTTPException(status_code=502, detail=f"Agent unavailable: {exc}")
+
+    # ── Legacy fallback (kept for reference, never reached) ──────────────────
+    americas_requested = intent.get("americas_requested", False)
     reasoning: list[ReasoningStep] = []
     tool_calls: list[str] = []
     step_timing: dict[str, float] = {}
