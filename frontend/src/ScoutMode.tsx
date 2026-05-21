@@ -1,6 +1,14 @@
 /**
- * GemScout Agent UI — the "money shot" for the hackathon demo.
- * Natural language → MongoDB Atlas Vector Search → Gemini scouting report.
+ * GemScout Agent UI — streaming edition.
+ * Natural language → ADK Agent (Gemini 3 Pro) → MCP → MongoDB Atlas → live scouting report.
+ *
+ * The frontend consumes a Server-Sent Events stream from /api/agent/scout/stream:
+ *   step_start  → push reasoning step
+ *   step_done   → close reasoning step with result_summary
+ *   player      → push player card (one at a time as MCP returns them)
+ *   text        → append chunk to scouting dossier
+ *   done        → finalise
+ *   error       → surface error
  */
 
 import { useRef, useState } from 'react'
@@ -9,12 +17,18 @@ import {
   Bot,
   ChevronRight,
   CircleCheck,
+  Database,
+  ExternalLink,
   Loader2,
   Search,
   Sparkles,
   Trophy,
   Zap,
 } from 'lucide-react'
+
+// ─── Config ─────────────────────────────────────────────────────────────────
+
+const ADK_AGENT_UI = 'https://gemscout-agent-377689698254.europe-west3.run.app'
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -47,40 +61,6 @@ type ScoutPlayer = {
   vector_score: number | null
   profile_text: string
   trend?: PlayerTrend
-}
-
-type DebugInfo = {
-  query_intent: Record<string, unknown>
-  filters_applied: Record<string, unknown>
-  semantic_candidates: Array<{
-    name: string
-    team: string
-    league: string
-    age: number
-    position: string
-    vector_score: number
-  }>
-  quant_candidates_count: number
-  final_ranking: Array<{
-    name: string
-    team: string
-    vector_score: number
-    stat_score: number
-    combined_score: number
-  }>
-  timing_ms: Record<string, number>
-  vector_index: string
-  embedding_model: string
-  llm_model: string
-}
-
-type ScoutResponse = {
-  query: string
-  reasoning_steps: ReasoningStep[]
-  players: ScoutPlayer[]
-  scouting_report: string
-  tool_calls: string[]
-  debug_info?: DebugInfo
 }
 
 // ─── Example queries ────────────────────────────────────────────────────────
@@ -119,8 +99,6 @@ const EXAMPLE_QUERIES: ExampleQuery[] = [
       'South American midfielder playing in Europe, under 25, undervalued by Transfermarkt relative to their statistical output, World Cup squad candidate',
   },
 ]
-
-// ─── Position + League chips config ────────────────────────────────────────
 
 const POSITIONS = [
   { value: '', label: 'All pos.' },
@@ -166,18 +144,20 @@ function tierColor(tier: number): string {
   return colors[tier] ?? 'text-[#8b949e] border-[#3d3a39] bg-[#1a1a1a]'
 }
 
-const ACTION_ICONS: Record<string, React.ReactNode> = {
-  semantic_player_search: <Sparkles size={14} />,
-  filter_players: <Search size={14} />,
-  rank_candidates: <Trophy size={14} />,
-  generate_scouting_report: <Bot size={14} />,
+function actionIcon(action: string): React.ReactNode {
+  if (action.startsWith('mcp:aggregate')) return <Database size={14} />
+  if (action.startsWith('mcp:find')) return <Search size={14} />
+  if (action.startsWith('mcp:count')) return <Zap size={14} />
+  if (action === 'connecting') return <Bot size={14} />
+  return <Zap size={14} />
 }
 
-const ACTION_LABELS: Record<string, string> = {
-  semantic_player_search: 'Atlas Vector Search (Voyage AI)',
-  filter_players: 'Quantitative filter',
-  rank_candidates: 'Combine + rank',
-  generate_scouting_report: 'Gemini scouting report',
+function actionLabel(action: string): string {
+  if (action === 'mcp:aggregate') return 'MongoDB aggregate — Atlas Search ($search pipeline)'
+  if (action === 'mcp:find') return 'MongoDB find — player profile lookup'
+  if (action === 'mcp:count') return 'MongoDB count'
+  if (action === 'connecting') return 'Connecting to GemScout agent (Gemini 3 Pro)'
+  return action
 }
 
 // ─── Sub-components ────────────────────────────────────────────────────────
@@ -214,44 +194,75 @@ function ChipRow<T extends string>({
   )
 }
 
-function ReasoningTrace({ steps, active }: { steps: ReasoningStep[]; active: boolean }) {
+function ReasoningTrace({
+  steps,
+  active,
+  done,
+}: {
+  steps: ReasoningStep[]
+  active: boolean
+  done: boolean
+}) {
   return (
     <div className="mt-4 rounded-lg border border-[#3d3a39] bg-[#1a1a1a] p-4">
-      <div className="mb-3 flex items-center gap-2">
-        <Zap size={14} className="text-[#00d992]" />
-        <span className="text-xs font-semibold uppercase tracking-[2.52px] text-[#8b949e]">
-          Agent Reasoning
-        </span>
-        {active && <Loader2 size={12} className="animate-spin text-[#00d992]" />}
+      <div className="mb-3 flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2">
+          <Zap size={14} className="text-[#00d992]" />
+          <span className="text-xs font-semibold uppercase tracking-[2.52px] text-[#8b949e]">
+            Agent Reasoning {active && '· Live'}
+          </span>
+          {active && <Loader2 size={12} className="animate-spin text-[#00d992]" />}
+        </div>
+        {done && steps.length > 0 && (
+          <a
+            href={ADK_AGENT_UI}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center gap-1 text-[11px] text-[#8b949e] transition hover:text-[#00d992]"
+          >
+            Agent UI
+            <ExternalLink size={10} />
+          </a>
+        )}
       </div>
+
+      {steps.length === 0 && active && (
+        <div className="flex items-center gap-2 text-[12px] text-[#8b949e]">
+          <Loader2 size={12} className="animate-spin text-[#00d992]" />
+          <span>Creating ADK session and dispatching to Gemini 3 Pro…</span>
+        </div>
+      )}
+
       <div className="flex flex-col gap-2">
-        {steps.map((step) => (
-          <div key={step.step} className="flex items-start gap-3">
-            <div className="mt-0.5 flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full border border-[#00d992]/30 bg-[#00d992]/10 text-[#00d992]">
-              {step.result_summary ? (
-                <CircleCheck size={12} />
-              ) : active ? (
-                <Loader2 size={12} className="animate-spin" />
-              ) : (
-                <ChevronRight size={12} />
-              )}
-            </div>
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-2">
-                <span className="text-[#00d992]">
-                  {ACTION_ICONS[step.action] ?? <Zap size={14} />}
-                </span>
-                <span className="text-xs font-semibold text-[#f2f2f2]">
-                  {ACTION_LABELS[step.action] ?? step.action}
-                </span>
+        {steps.map((step, idx) => {
+          const isLast = idx === steps.length - 1
+          const isRunning = active && isLast && !step.result_summary
+          return (
+            <div key={step.step} className="flex items-start gap-3">
+              <div className="mt-0.5 flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full border border-[#00d992]/30 bg-[#00d992]/10 text-[#00d992]">
+                {step.result_summary ? (
+                  <CircleCheck size={12} />
+                ) : isRunning ? (
+                  <Loader2 size={12} className="animate-spin" />
+                ) : (
+                  <ChevronRight size={12} />
+                )}
               </div>
-              <p className="mt-0.5 text-[11px] text-[#8b949e]">{step.detail}</p>
-              {step.result_summary && (
-                <p className="mt-1 text-[11px] text-[#bdbdbd]">{step.result_summary}</p>
-              )}
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2">
+                  <span className="text-[#00d992]">{actionIcon(step.action)}</span>
+                  <span className="text-xs font-semibold text-[#f2f2f2]">
+                    {actionLabel(step.action)}
+                  </span>
+                </div>
+                <p className="mt-0.5 break-all text-[11px] text-[#8b949e]">{step.detail}</p>
+                {step.result_summary && (
+                  <p className="mt-1 text-[11px] text-[#bdbdbd]">{step.result_summary}</p>
+                )}
+              </div>
             </div>
-          </div>
-        ))}
+          )
+        })}
       </div>
     </div>
   )
@@ -317,7 +328,6 @@ function TrendBadge({ trend }: { trend?: PlayerTrend }) {
   return (
     <div className={`flex items-center gap-2 rounded border px-2 py-1 ${color}`}>
       <span className="text-[11px] font-bold">{icon} WC cycle</span>
-      {/* mini bar chart */}
       <div className="flex items-end gap-0.5">
         {vals.map((v, i) => (
           <div
@@ -341,7 +351,15 @@ function TrendBadge({ trend }: { trend?: PlayerTrend }) {
   )
 }
 
-function PlayerCard({ player, rank }: { player: ScoutPlayer; rank: number }) {
+function PlayerCard({
+  player,
+  rank,
+  onFindSimilar,
+}: {
+  player: ScoutPlayer
+  rank: number
+  onFindSimilar?: (p: ScoutPlayer) => void
+}) {
   const norm = player.metrics_normalized
   const stats = player.stats
   const pos = player.position?.toUpperCase()
@@ -349,7 +367,6 @@ function PlayerCard({ player, rank }: { player: ScoutPlayer; rank: number }) {
     (m) => norm[m.key] != null,
   )
 
-  // Extract the first sentence or up to 120 chars of profile_text
   const profileSnippet = (() => {
     if (!player.profile_text) return null
     const dot = player.profile_text.indexOf('. ')
@@ -377,20 +394,20 @@ function PlayerCard({ player, rank }: { player: ScoutPlayer; rank: number }) {
           <span className="rounded border border-[#3d3a39] bg-[#101010] px-2 py-0.5 text-xs font-semibold text-[#f2f2f2]">
             {player.position}
           </span>
-          <span className={`rounded border px-1.5 py-0.5 text-[10px] font-medium ${tierColor(player.league_tier)}`}>
+          <span
+            className={`rounded border px-1.5 py-0.5 text-[10px] font-medium ${tierColor(player.league_tier)}`}
+          >
             {tierLabel(player.league_tier)}
           </span>
         </div>
       </div>
 
-      {/* Tactical profile snippet */}
       {profileSnippet && (
         <p className="mb-3 rounded border border-[#3d3a39] bg-[#101010] px-3 py-2 text-[12px] italic leading-relaxed text-[#8b949e]">
           {profileSnippet}
         </p>
       )}
 
-      {/* Percentile bars */}
       {keyMetrics.length > 0 && (
         <div className="mb-3 grid grid-cols-3 gap-1.5 sm:grid-cols-6">
           {keyMetrics.slice(0, 6).map((m) => {
@@ -400,7 +417,9 @@ function PlayerCard({ player, rank }: { player: ScoutPlayer; rank: number }) {
               <div key={m.key} className="rounded border border-[#3d3a39] bg-[#101010] p-2">
                 <div className="mb-1 flex items-baseline justify-between gap-1">
                   <span className="truncate text-[11px] text-[#8b949e]">{m.label}</span>
-                  <span className="flex-shrink-0 font-mono text-[11px] font-bold text-[#00d992]">{pct(percentile)}</span>
+                  <span className="flex-shrink-0 font-mono text-[11px] font-bold text-[#00d992]">
+                    {pct(percentile)}
+                  </span>
                 </div>
                 <div className="h-1 w-full overflow-hidden rounded-full bg-[#3d3a39]">
                   <div
@@ -419,7 +438,6 @@ function PlayerCard({ player, rank }: { player: ScoutPlayer; rank: number }) {
         </div>
       )}
 
-      {/* Footer */}
       <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-[#8b949e]">
         <div className="flex items-center gap-2">
           <span>{player.league}</span>
@@ -432,10 +450,16 @@ function PlayerCard({ player, rank }: { player: ScoutPlayer; rank: number }) {
         </div>
         <div className="flex items-center gap-2">
           <TrendBadge trend={player.trend} />
-          {player.vector_score != null && (
-            <span className="font-mono text-[10px]" title="Semantic similarity score">
-              sim {(player.vector_score * 100).toFixed(1)}%
-            </span>
+          {onFindSimilar && (
+            <button
+              type="button"
+              onClick={() => onFindSimilar(player)}
+              title="Find tactically similar players via Atlas Vector Search (MCP)"
+              className="flex items-center gap-1 rounded border border-[#00d992]/40 bg-[#00d992]/10 px-2 py-1 text-[10px] font-semibold text-[#00d992] transition hover:bg-[#00d992]/20"
+            >
+              <Sparkles size={10} />
+              Find similar
+            </button>
           )}
         </div>
       </div>
@@ -473,22 +497,22 @@ function confidenceTextClass(text: string): string {
   return 'text-[#8b949e]'
 }
 
-function ScoutingReport({ report }: { report: string }) {
+function ScoutingReport({ report, streaming }: { report: string; streaming: boolean }) {
   const lines = report.split('\n')
   return (
     <div className="rounded-lg border border-[#3d3a39] bg-[#1a1a1a] p-5">
       <div className="mb-5 flex items-center gap-2">
         <Bot size={16} className="text-[#00d992]" />
         <span className="text-xs font-semibold uppercase tracking-[2.52px] text-[#8b949e]">
-          Gemini Scouting Dossier
+          Gemini 3 Pro — Scouting Dossier {streaming && '· Writing…'}
         </span>
+        {streaming && <Loader2 size={12} className="animate-spin text-[#00d992]" />}
       </div>
       <div className="space-y-2">
         {lines.map((raw, i) => {
           const line = raw.trimEnd()
           const trimmed = line.trim()
 
-          // Player name header
           if (trimmed.match(/^#{1,3}\s/)) {
             const name = trimmed.replace(/^#+\s/, '')
             return (
@@ -501,10 +525,8 @@ function ScoutingReport({ report }: { report: string }) {
             )
           }
 
-          // --- divider: skipped (handled by the border-t on player headers)
           if (trimmed === '---') return null
 
-          // RECOMMENDATION: VALUE
           if (trimmed.match(/^RECOMMENDATION:/)) {
             const value = trimmed.replace(/^RECOMMENDATION:\s*/, '')
             return (
@@ -512,14 +534,15 @@ function ScoutingReport({ report }: { report: string }) {
                 <span className="text-[10px] font-semibold uppercase tracking-[1.5px] text-[#8b949e]">
                   Recomendación
                 </span>
-                <span className={`rounded border px-2.5 py-0.5 text-xs font-bold ${recoBadgeClass(value)}`}>
+                <span
+                  className={`rounded border px-2.5 py-0.5 text-xs font-bold ${recoBadgeClass(value)}`}
+                >
                   {value}
                 </span>
               </div>
             )
           }
 
-          // CONFIDENCE: HIGH — reason
           if (trimmed.match(/^CONFIDENCE:/)) {
             const rest = trimmed.replace(/^CONFIDENCE:\s*/, '')
             const dashIdx = rest.indexOf('—')
@@ -533,57 +556,69 @@ function ScoutingReport({ report }: { report: string }) {
             )
           }
 
-          // WORLD CUP CYCLE TREND — mini green callout
           if (trimmed.match(/^WORLD CUP CYCLE TREND/)) {
             return (
-              <p key={i} className="mt-3 rounded border border-[#00d992]/25 bg-[#00d992]/5 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-[1.5px] text-[#00d992]">
+              <p
+                key={i}
+                className="mt-3 rounded border border-[#00d992]/25 bg-[#00d992]/5 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-[1.5px] text-[#00d992]"
+              >
                 {trimmed}
               </p>
             )
           }
 
-          // WORLD CUP … VERDICT: — highlighted callout label
           if (trimmed.match(/^WORLD CUP/)) {
             return (
-              <p key={i} className="mt-3 text-[10px] font-semibold uppercase tracking-[1.5px] text-[#00d992]">
+              <p
+                key={i}
+                className="mt-3 text-[10px] font-semibold uppercase tracking-[1.5px] text-[#00d992]"
+              >
                 {trimmed}
               </p>
             )
           }
 
-          // Other ALLCAPS section labels (TACTICAL VERDICT:, KEY STRENGTHS:, RISK FLAGS:…)
           if (trimmed.match(/^[A-Z][A-Z\s\d]+:/)) {
             return (
-              <p key={i} className="mt-3 text-[10px] font-semibold uppercase tracking-[1.5px] text-[#00d992]">
+              <p
+                key={i}
+                className="mt-3 text-[10px] font-semibold uppercase tracking-[1.5px] text-[#00d992]"
+              >
                 {trimmed}
               </p>
             )
           }
 
-          // Bullet points
           if (trimmed.match(/^[-•]\s/) || trimmed.match(/^\s+[-•]\s/)) {
             const content = trimmed.replace(/^[-•]\s+/, '')
             return (
-              <div key={i} className="flex gap-2.5 pl-1 text-[13px] leading-relaxed text-[#bdbdbd]">
+              <div
+                key={i}
+                className="flex gap-2.5 pl-1 text-[13px] leading-relaxed text-[#bdbdbd]"
+              >
                 <span className="mt-[7px] h-1.5 w-1.5 flex-shrink-0 rounded-full bg-[#00d992]/50" />
                 <span>{renderInline(content)}</span>
               </div>
             )
           }
 
-          // Warning
           if (trimmed.match(/^⚠/)) {
             return (
-              <p key={i} className="rounded border border-yellow-500/20 bg-yellow-500/5 px-3 py-2 text-[12px] text-yellow-300">
+              <p
+                key={i}
+                className="rounded border border-yellow-500/20 bg-yellow-500/5 px-3 py-2 text-[12px] text-yellow-300"
+              >
                 {trimmed}
               </p>
             )
           }
 
-          // Regular paragraph
           return trimmed ? (
             <p key={i} className="text-[13px] leading-relaxed text-[#bdbdbd]">
               {renderInline(trimmed)}
+              {streaming && i === lines.length - 1 && (
+                <span className="ml-0.5 inline-block h-3 w-1 animate-pulse bg-[#00d992]/70" />
+              )}
             </p>
           ) : (
             <div key={i} className="h-1" />
@@ -594,38 +629,57 @@ function ScoutingReport({ report }: { report: string }) {
   )
 }
 
-function DebugPanel({ info }: { info: DebugInfo }) {
-  const totalMs = Object.values(info.timing_ms).reduce((a, b) => a + b, 0)
+// ─── Judges / Technical Panel ──────────────────────────────────────────────
 
-  const STEP_EXPLANATIONS: Record<string, string> = {
-    semantic_search: 'Query → 1536-dim vector → cosine similarity over all ~2,200 player embeddings',
-    quant_filter: 'Hard filter on age, position, league tier, then sort by position-specific stat',
-    report_generation: `Prompt with top-3 player profiles + percentile stats → ${info.llm_model} → structured dossier`,
-  }
+function AgentPanel({
+  steps,
+  players,
+  toolCalls,
+}: {
+  steps: ReasoningStep[]
+  players: ScoutPlayer[]
+  toolCalls: string[]
+}) {
+  const mcpCalls = steps.filter((s) => s.action.startsWith('mcp:'))
 
   return (
     <div className="mt-6 rounded-lg border border-yellow-500/30 bg-yellow-500/5 p-5">
-      <div className="mb-4 flex items-center gap-2">
-        <span className="text-sm font-bold text-yellow-300">⚡ Technical View — Judges Panel</span>
-        <span className="rounded border border-yellow-500/20 bg-yellow-500/10 px-2 py-0.5 text-[11px] text-yellow-400">
-          {totalMs.toFixed(0)} ms total
-        </span>
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <span className="text-sm font-bold text-yellow-300">⚡ Technical View — Judges Panel</span>
+          <span className="rounded border border-yellow-500/20 bg-yellow-500/10 px-2 py-0.5 text-[11px] text-yellow-400">
+            ADK + MCP · Gemini 3 Pro
+          </span>
+          <span className="rounded border border-yellow-500/20 bg-yellow-500/10 px-2 py-0.5 text-[11px] text-yellow-400">
+            {toolCalls.length} MCP calls
+          </span>
+        </div>
+        <a
+          href={ADK_AGENT_UI}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="flex items-center gap-1.5 rounded border border-yellow-500/30 bg-yellow-500/10 px-3 py-1.5 text-[11px] font-semibold text-yellow-300 transition hover:bg-yellow-500/20"
+        >
+          <ExternalLink size={12} />
+          Open ADK Agent UI
+        </a>
       </div>
 
-      {/* Architecture pipeline */}
       <div className="mb-4 rounded border border-white/10 bg-black/30 p-4">
-        <p className="mb-2 text-[11px] font-semibold uppercase tracking-[1.5px] text-[#8b949e]">Full Pipeline</p>
+        <p className="mb-2 text-[11px] font-semibold uppercase tracking-[1.5px] text-[#8b949e]">
+          Streaming Pipeline (Server-Sent Events end-to-end)
+        </p>
         <div className="flex flex-wrap items-center gap-1 font-mono text-[12px]">
           {[
             { label: 'NL Query', color: 'text-[#f2f2f2]' },
-            { label: `${info.embedding_model}`, color: 'text-blue-300', note: '1536-dim embedding' },
-            { label: `Atlas: ${info.vector_index}`, color: 'text-[#00d992]', note: 'cosine similarity' },
-            { label: 'Quantitative filter', color: 'text-yellow-300', note: 'age / position / league' },
-            { label: '60% vec + 40% stat', color: 'text-orange-300', note: 'combined score' },
-            { label: info.llm_model, color: 'text-purple-300', note: 'scouting dossier' },
+            { label: 'FastAPI /scout/stream', color: 'text-blue-300' },
+            { label: 'ADK /run_sse', color: 'text-purple-300' },
+            { label: 'Gemini 3 Pro', color: 'text-orange-300' },
+            { label: 'MongoDB MCP (partner)', color: 'text-[#00d992]' },
+            { label: 'Atlas Search + Vector', color: 'text-yellow-300' },
           ].map((node, i, arr) => (
             <span key={i} className="flex items-center gap-1">
-              <span className={`rounded border border-white/10 bg-black/40 px-2 py-0.5 ${node.color}`} title={node.note}>
+              <span className={`rounded border border-white/10 bg-black/40 px-2 py-0.5 ${node.color}`}>
                 {node.label}
               </span>
               {i < arr.length - 1 && <span className="text-[#3d3a39]">→</span>}
@@ -635,272 +689,278 @@ function DebugPanel({ info }: { info: DebugInfo }) {
       </div>
 
       <div className="grid gap-3 md:grid-cols-2">
-        {/* Query intent + filters */}
         <div className="rounded border border-white/10 bg-black/25 p-3">
           <p className="mb-2 text-[11px] font-semibold uppercase tracking-[1.5px] text-[#8b949e]">
-            Query Intent Parsing
+            MCP Tool Calls ({mcpCalls.length})
           </p>
-          <p className="mb-2 text-[11px] text-[#8b949e]">
-            Regex patterns extract structured hints from the natural language query.
-          </p>
-          {Object.entries(info.query_intent).map(([k, v]) => {
-            const detected = k.startsWith('detected_') || k === 'americas_league_flag'
-            return (
-              <div key={k} className="flex justify-between gap-2 py-0.5 text-[12px]">
-                <span className="text-[#8b949e]">{k.replace(/_/g, ' ')}</span>
-                <span className={`font-mono ${detected ? 'text-[#f2f2f2]' : 'text-[#00d992]'}`}>
-                  {v != null ? String(v) : '—'}
-                </span>
-              </div>
-            )
-          })}
-          <div className="mt-2 border-t border-white/10 pt-2">
-            <p className="mb-1 text-[11px] text-[#8b949e]">Active MongoDB filters:</p>
-            {Object.entries(info.filters_applied).map(([k, v]) => (
-              <div key={k} className="flex justify-between gap-2 py-0.5 text-[12px]">
-                <span className="text-[#8b949e]">{k.replace(/_/g, ' ')}</span>
-                <span className="font-mono text-[#00d992]">{v != null ? String(v) : '—'}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        {/* Timing breakdown */}
-        <div className="rounded border border-white/10 bg-black/25 p-3">
-          <p className="mb-2 text-[11px] font-semibold uppercase tracking-[1.5px] text-[#8b949e]">Step Timing</p>
-          {Object.entries(info.timing_ms).map(([step, ms]) => {
-            const pct = Math.round((ms / totalMs) * 100)
-            const explanation = STEP_EXPLANATIONS[step]
-            return (
-              <div key={step} className="mb-2.5">
-                <div className="flex justify-between text-[12px]">
-                  <span className="text-[#bdbdbd]">{step.replace(/_/g, ' ')}</span>
-                  <span className="font-mono text-[#00d992]">{ms} ms</span>
-                </div>
-                {explanation && (
-                  <p className="mb-0.5 text-[11px] leading-tight text-[#8b949e]">{explanation}</p>
-                )}
-                <div className="h-1 w-full overflow-hidden rounded-full bg-[#3d3a39]">
-                  <div className="h-full rounded-full bg-[#00d992]/60" style={{ width: `${pct}%` }} />
-                </div>
-              </div>
-            )
-          })}
-          <p className="mt-2 border-t border-white/10 pt-2 text-[11px] text-[#8b949e]">
-            Embedding model: <span className="text-[#f2f2f2]">{info.embedding_model}</span> (dim 1536) ·
-            {' '}LLM: <span className="text-[#f2f2f2]">{info.llm_model}</span> · Vertex AI us-central1
-          </p>
-        </div>
-      </div>
-
-      {/* Atlas Vector Search candidates */}
-      <div className="mt-3 rounded border border-white/10 bg-black/25 p-3">
-        <div className="mb-2 flex items-baseline gap-2">
-          <p className="text-[11px] font-semibold uppercase tracking-[1.5px] text-[#8b949e]">
-            Step 1 — Atlas Vector Search ({info.semantic_candidates.length} semantic candidates)
-          </p>
-          <span className="text-[11px] text-[#8b949e]">
-            numCandidates: {info.semantic_candidates.length * 20}+ · cosine similarity · post-filtered
-          </span>
-        </div>
-        <div className="overflow-x-auto">
-          <table className="w-full min-w-[500px] text-left text-[12px]">
-            <thead>
-              <tr className="border-b border-white/10 text-[#8b949e]">
-                <th className="pb-1 pr-4">#</th>
-                <th className="pb-1 pr-4">Player</th>
-                <th className="pb-1 pr-4">Club · League</th>
-                <th className="pb-1 pr-4">Pos · Age</th>
-                <th className="pb-1 text-right">Cosine sim.</th>
-              </tr>
-            </thead>
-            <tbody>
-              {info.semantic_candidates.map((c, i) => (
-                <tr key={c.name} className="border-b border-white/[0.04]">
-                  <td className="py-1 pr-4 text-[#8b949e]">{i + 1}</td>
-                  <td className="py-1 pr-4 font-medium text-[#f2f2f2]">{c.name}</td>
-                  <td className="py-1 pr-4 text-[#8b949e]">{c.team} · {c.league}</td>
-                  <td className="py-1 pr-4 text-[#8b949e]">{c.position} · {c.age}y</td>
-                  <td className="py-1 text-right">
-                    <span className="font-mono text-[#00d992]">{c.vector_score.toFixed(4)}</span>
-                    <div className="mt-0.5 h-1 w-full overflow-hidden rounded-full bg-[#3d3a39]">
-                      <div
-                        className="h-full rounded-full bg-[#00d992]"
-                        style={{ width: `${Math.round(c.vector_score * 100)}%` }}
-                      />
+          {mcpCalls.length === 0 ? (
+            <p className="text-[12px] text-[#8b949e]">No MCP calls recorded yet</p>
+          ) : (
+            <div className="space-y-3">
+              {mcpCalls.map((step, i) => {
+                const toolName = step.action.replace('mcp:', '')
+                const rawDetail = step.detail
+                  .replace(`MCP tool call → ${toolName}(`, '')
+                  .replace(/\)$/, '')
+                return (
+                  <div key={i} className="rounded border border-white/[0.06] bg-black/20 p-2">
+                    <div className="mb-1 flex items-center gap-2">
+                      <span className="text-[#00d992]">{actionIcon(step.action)}</span>
+                      <span className="text-[12px] font-semibold text-[#f2f2f2]">{toolName}</span>
+                      {step.result_summary && (
+                        <span className="ml-auto rounded bg-[#00d992]/15 px-1.5 py-0.5 text-[10px] font-medium text-[#00d992]">
+                          {step.result_summary}
+                        </span>
+                      )}
                     </div>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+                    <pre className="overflow-x-auto whitespace-pre-wrap break-all font-mono text-[10px] leading-relaxed text-[#8b949e]">
+                      {rawDetail.slice(0, 400)}
+                      {rawDetail.length > 400 ? '…' : ''}
+                    </pre>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </div>
+
+        <div className="rounded border border-white/10 bg-black/25 p-3">
+          <p className="mb-2 text-[11px] font-semibold uppercase tracking-[1.5px] text-[#8b949e]">
+            Players via MCP ({players.length})
+          </p>
+          {players.length === 0 ? (
+            <p className="text-[12px] text-[#8b949e]">No players returned yet</p>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-[12px]">
+                <thead>
+                  <tr className="border-b border-white/10 text-[#8b949e]">
+                    <th className="pb-1 pr-3">#</th>
+                    <th className="pb-1 pr-3">Player</th>
+                    <th className="pb-1 pr-3">Club</th>
+                    <th className="pb-1 pr-3">Pos · Age</th>
+                    <th className="pb-1 text-right">TM Value</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {players.map((p, i) => (
+                    <tr key={p.id} className="border-b border-white/[0.04]">
+                      <td className="py-1 pr-3 text-[#8b949e]">{i + 1}</td>
+                      <td className="py-1 pr-3 font-medium text-[#f2f2f2]">{p.name}</td>
+                      <td className="py-1 pr-3 text-[#8b949e]">{p.current_team}</td>
+                      <td className="py-1 pr-3 text-[#8b949e]">
+                        {p.position} · {p.age}y
+                      </td>
+                      <td className="py-1 text-right font-mono text-[#00d992]">
+                        {formatValue(p.market_value_eur)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
       </div>
 
-      {/* Final ranking */}
-      <div className="mt-3 rounded border border-white/10 bg-black/25 p-3">
-        <div className="mb-2 flex items-baseline gap-2">
-          <p className="text-[11px] font-semibold uppercase tracking-[1.5px] text-[#8b949e]">
-            Step 3 — Combined Ranking
-          </p>
-          <span className="text-[11px] text-[#8b949e]">
-            score = <span className="text-[#00d992]">0.6</span> × cosine_sim×100 + <span className="text-[#00d992]">0.4</span> × position_stat_percentile_avg
-          </span>
-        </div>
-        <div className="mb-1.5 grid grid-cols-[24px_minmax(0,1fr)_80px_80px_88px] gap-2 text-[11px] text-[#8b949e]">
-          <span>#</span><span>Player · Club</span>
-          <span className="text-right">vec score</span>
-          <span className="text-right">stat p̄</span>
-          <span className="text-right font-semibold text-[#00d992]">combined</span>
-        </div>
-        <div className="space-y-1">
-          {info.final_ranking.map((p, i) => (
-            <div key={p.name} className="grid grid-cols-[24px_minmax(0,1fr)_80px_80px_88px] items-center gap-2 text-[12px]">
-              <span className="text-[#8b949e]">{i + 1}</span>
-              <span className="font-medium text-[#f2f2f2]">
-                {p.name}
-                <span className="ml-1 font-normal text-[#8b949e]">· {p.team}</span>
-              </span>
-              <span className="text-right font-mono text-[#8b949e]" title="semantic similarity × 100">
-                {(p.vector_score * 100).toFixed(1)}
-              </span>
-              <span className="text-right font-mono text-[#8b949e]" title="position stat percentile avg">
-                {p.stat_score?.toFixed(1) ?? '—'}
-              </span>
-              <span className="text-right font-mono font-bold text-[#00d992]">
-                {p.combined_score.toFixed(1)}
-              </span>
-            </div>
-          ))}
-        </div>
-        <p className="mt-2 text-[11px] text-[#8b949e]">
-          Quant-filter added {info.quant_candidates_count > 0 ? `${info.quant_candidates_count}` : '0'} extra candidates
-          {info.quant_candidates_count > 0 ? ' (sorted by position stat, merged into semantic pool)' : ' (all candidates came from vector search)'}
+      <div className="mt-4 rounded border border-yellow-500/20 bg-yellow-500/5 p-3">
+        <p className="text-[12px] text-yellow-200/80">
+          <span className="font-semibold">💡 Deeper inspection:</span> The ADK Agent UI exposes
+          each Gemini turn, the exact MCP tool requests/responses, and the full reasoning trace.
         </p>
+        <a
+          href={ADK_AGENT_UI}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="mt-2 flex items-center gap-1.5 text-[12px] font-semibold text-yellow-300 transition hover:text-yellow-200"
+        >
+          <ExternalLink size={12} />
+          {ADK_AGENT_UI}
+        </a>
       </div>
     </div>
   )
 }
 
-// ─── Main ScoutMode component ───────────────────────────────────────────────
+// ─── Main component ────────────────────────────────────────────────────────
+
+type StreamMode = 'scout' | 'similar'
 
 export default function ScoutMode() {
   const [query, setQuery] = useState('')
   const [position, setPosition] = useState<string>('')
   const [leagueSlug, setLeagueSlug] = useState<string>('')
   const [maxAge, setMaxAge] = useState<string>('')
+
   const [loading, setLoading] = useState(false)
-  const [streamingSteps, setStreamingSteps] = useState<ReasoningStep[]>([])
-  const [result, setResult] = useState<ScoutResponse | null>(null)
+  const [done, setDone] = useState(false)
+  const [steps, setSteps] = useState<ReasoningStep[]>([])
+  const [players, setPlayers] = useState<ScoutPlayer[]>([])
+  const [report, setReport] = useState<string>('')
+  const [toolCalls, setToolCalls] = useState<string[]>([])
+  const [activeMode, setActiveMode] = useState<{ mode: StreamMode; refName?: string } | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [judgesMode, setJudgesMode] = useState(false)
+
   const abortRef = useRef<AbortController | null>(null)
 
-  const handleSubmit = async (q = query) => {
-    if (!q.trim() || loading) return
+  const resetForNewRun = (mode: StreamMode, refName?: string) => {
     abortRef.current?.abort()
+    setLoading(true)
+    setDone(false)
+    setError(null)
+    setSteps([])
+    setPlayers([])
+    setReport('')
+    setToolCalls([])
+    setActiveMode({ mode, refName })
+  }
+
+  // Process one SSE event from the backend stream
+  const handleEvent = (ev: any) => {
+    switch (ev.type) {
+      case 'step_start':
+        setSteps((prev) => [
+          ...prev,
+          {
+            step: ev.step,
+            action: ev.action,
+            detail: ev.detail,
+            result_summary: null,
+          },
+        ])
+        if (ev.action?.startsWith('mcp:')) {
+          setToolCalls((prev) => [...prev, ev.action.replace('mcp:', '')])
+        }
+        break
+
+      case 'step_done':
+        setSteps((prev) => {
+          if (prev.length === 0) return prev
+          const next = [...prev]
+          const last = next[next.length - 1]
+          next[next.length - 1] = { ...last, result_summary: ev.result_summary || 'done' }
+          return next
+        })
+        break
+
+      case 'player':
+        setPlayers((prev) => {
+          if (prev.find((p) => p.id === ev.player.id)) return prev
+          return [...prev, ev.player as ScoutPlayer]
+        })
+        break
+
+      case 'text':
+        setReport((prev) => prev + (ev.chunk || ''))
+        break
+
+      case 'done':
+        setLoading(false)
+        setDone(true)
+        break
+
+      case 'error':
+        setError(ev.message || 'Unknown stream error')
+        setLoading(false)
+        break
+    }
+  }
+
+  const streamRun = async (
+    url: string,
+    body: Record<string, unknown>,
+    mode: StreamMode,
+    refName?: string,
+  ) => {
+    resetForNewRun(mode, refName)
+
     const ctrl = new AbortController()
     abortRef.current = ctrl
 
-    setLoading(true)
-    setError(null)
-    setResult(null)
-    setStreamingSteps([])
-
-    const simulatedSteps: ReasoningStep[] = [
-      {
-        step: 1,
-        action: 'semantic_player_search',
-        detail: `Translating '${q}' to a tactical embedding via Voyage AI, querying MongoDB Atlas Vector Search`,
-        result_summary: null,
-      },
-    ]
-    setStreamingSteps([...simulatedSteps])
-
-    const timers: ReturnType<typeof setTimeout>[] = []
-    timers.push(
-      setTimeout(() => {
-        setStreamingSteps((prev) => [
-          ...prev,
-          {
-            step: 2,
-            action: 'filter_players',
-            detail: 'Cross-referencing with quantitative filters to validate candidates',
-            result_summary: null,
-          },
-        ])
-      }, 800),
-    )
-    timers.push(
-      setTimeout(() => {
-        setStreamingSteps((prev) => [
-          ...prev,
-          {
-            step: 3,
-            action: 'rank_candidates',
-            detail: 'Scoring candidates by combined semantic similarity + statistical percentile',
-            result_summary: null,
-          },
-        ])
-      }, 1600),
-    )
-    timers.push(
-      setTimeout(() => {
-        setStreamingSteps((prev) => [
-          ...prev,
-          {
-            step: 4,
-            action: 'generate_scouting_report',
-            detail: 'Calling Gemini 2.5 Flash to generate detailed scouting dossier…',
-            result_summary: null,
-          },
-        ])
-      }, 2400),
-    )
-
     try {
-      const body: Record<string, unknown> = {
-        query: q,
-        season: '2025-26',
-        world_cup_context: true,
-        limit: 5,
-        debug_mode: judgesMode,
-      }
-      if (position) body.position = position
-      if (maxAge) body.max_age = parseInt(maxAge, 10)
-      if (leagueSlug) body.league_slug = leagueSlug
-
-      const resp = await fetch('/api/agent/scout', {
+      const resp = await fetch(url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
         body: JSON.stringify(body),
         signal: ctrl.signal,
       })
 
-      timers.forEach(clearTimeout)
-
-      if (!resp.ok) {
-        const text = await resp.text()
-        throw new Error(`${resp.status}: ${text}`)
+      if (!resp.ok || !resp.body) {
+        const text = await resp.text().catch(() => '')
+        throw new Error(`${resp.status}: ${text || resp.statusText}`)
       }
 
-      const data: ScoutResponse = await resp.json()
-      setResult(data)
-      setStreamingSteps(data.reasoning_steps)
+      const reader = resp.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      while (true) {
+        const { done: readerDone, value } = await reader.read()
+        if (readerDone) break
+        buffer += decoder.decode(value, { stream: true })
+
+        const segments = buffer.split('\n\n')
+        buffer = segments.pop() || ''
+
+        for (const seg of segments) {
+          for (const line of seg.split('\n')) {
+            if (line.startsWith('data: ')) {
+              try {
+                const ev = JSON.parse(line.slice(6))
+                handleEvent(ev)
+              } catch {
+                /* ignore malformed events */
+              }
+            }
+          }
+        }
+      }
+      // ensure final state if backend forgot to emit `done`
+      setLoading(false)
+      setDone(true)
     } catch (err: unknown) {
-      timers.forEach(clearTimeout)
       if ((err as Error).name !== 'AbortError') {
         setError((err as Error).message)
       }
-    } finally {
       setLoading(false)
     }
   }
 
+  const handleScoutSubmit = async (q = query) => {
+    if (!q.trim() || loading) return
+
+    const body: Record<string, unknown> = {
+      query: q,
+      season: '2025-26',
+      world_cup_context: true,
+      limit: 5,
+      debug_mode: judgesMode,
+    }
+    if (position) body.position = position
+    if (maxAge) body.max_age = parseInt(maxAge, 10)
+    if (leagueSlug) body.league_slug = leagueSlug
+
+    await streamRun('/api/agent/scout/stream', body, 'scout')
+  }
+
+  const handleFindSimilar = async (player: ScoutPlayer) => {
+    if (loading) return
+    setQuery(`Players tactically similar to ${player.name}`)
+    await streamRun(
+      '/api/agent/scout/similar/stream',
+      { qid: player.id, debug_mode: judgesMode },
+      'similar',
+      player.name,
+    )
+  }
+
   const handleExampleClick = (q: string) => {
     setQuery(q)
-    handleSubmit(q)
+    handleScoutSubmit(q)
   }
+
+  const showResults = steps.length > 0 || players.length > 0 || report.length > 0
 
   return (
     <div className="mx-auto max-w-4xl px-4 pb-16 pt-6">
@@ -909,22 +969,21 @@ export default function ScoutMode() {
         <div className="mb-4 inline-flex items-center gap-2 rounded-full border border-[#00d992]/30 bg-[#00d992]/10 px-3 py-1">
           <Sparkles size={12} className="text-[#00d992]" />
           <span className="text-xs font-semibold uppercase tracking-[2.52px] text-[#00d992]">
-            Agent Builder · Atlas · Voyage AI · Gemini 2.5
+            ADK · MCP · Atlas Search + Vector · Gemini 3 Pro
           </span>
         </div>
         <h1 className="text-3xl font-black tracking-[-0.65px] text-[#f2f2f2] sm:text-4xl">
-          Find them{' '}
-          <span className="text-[#00d992]">before anyone else</span>
+          Find them <span className="text-[#00d992]">before anyone else</span>
         </h1>
         <p className="mt-2 text-sm text-[#8b949e]">
-          2,200+ players · Semantic + statistical scouting · World Cup 2026 ready
+          2,200+ players · Streaming AI agent via MCP · World Cup 2026 ready
         </p>
-        {/* Data coverage disclaimer */}
         <div className="mx-auto mt-3 flex max-w-lg items-start gap-2 rounded-lg border border-[#3d3a39] bg-[#1a1a1a] px-3 py-2 text-left">
           <AlertCircle size={13} className="mt-0.5 flex-shrink-0 text-[#8b949e]" />
           <p className="text-[11px] leading-relaxed text-[#8b949e]">
             <span className="font-semibold text-[#bdbdbd]">Coverage: </span>
-            Big-5 + Mid-European leagues (2025-26). No Americas/CONMEBOL league data — South American players are indexed based on their current European club.
+            Big-5 + Mid-European leagues (2025-26). No Americas/CONMEBOL league data — South
+            American players are indexed based on their current European club.
           </p>
         </div>
       </div>
@@ -938,23 +997,17 @@ export default function ScoutMode() {
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) handleSubmit()
+            if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) handleScoutSubmit()
           }}
         />
 
-        {/* Position chips */}
         <div className="mt-3 flex items-center gap-2">
           <span className="text-[11px] font-semibold uppercase tracking-[1.5px] text-[#8b949e]">
             Pos
           </span>
-          <ChipRow
-            options={POSITIONS}
-            value={position}
-            onChange={setPosition}
-          />
+          <ChipRow options={POSITIONS} value={position} onChange={setPosition} />
         </div>
 
-        {/* League chips */}
         <div className="mt-2 flex flex-wrap items-center gap-2">
           <span className="text-[11px] font-semibold uppercase tracking-[1.5px] text-[#8b949e]">
             Liga
@@ -966,7 +1019,6 @@ export default function ScoutMode() {
           />
         </div>
 
-        {/* Age + Scout button */}
         <div className="mt-3 flex flex-wrap items-center gap-2">
           <input
             type="number"
@@ -979,11 +1031,7 @@ export default function ScoutMode() {
           />
           <button
             type="button"
-            onClick={() => {
-              const next = !judgesMode
-              setJudgesMode(next)
-              if (next && result && query.trim()) handleSubmit(query)
-            }}
+            onClick={() => setJudgesMode((v) => !v)}
             title="Toggle technical detail for judges"
             className={`flex items-center gap-1.5 rounded border px-3 py-1.5 text-[11px] font-semibold transition ${
               judgesMode
@@ -996,22 +1044,30 @@ export default function ScoutMode() {
           <span className="text-[11px] text-[#8b949e]">Cmd+Enter</span>
           <button
             type="button"
-            onClick={() => handleSubmit()}
+            onClick={() => handleScoutSubmit()}
             disabled={loading || !query.trim()}
             className="ml-auto flex items-center gap-2 rounded bg-[#00d992] px-5 py-2 text-sm font-bold text-[#101010] transition hover:bg-[#2fd6a1] disabled:cursor-not-allowed disabled:opacity-50"
           >
-            {loading ? (
-              <Loader2 size={15} className="animate-spin" />
-            ) : (
-              <Search size={15} />
-            )}
+            {loading ? <Loader2 size={15} className="animate-spin" /> : <Search size={15} />}
             Scout
           </button>
         </div>
       </div>
 
-      {/* Example queries */}
-      {!result && !loading && (
+      {/* Mode badge — "Searching similar to X" */}
+      {activeMode?.mode === 'similar' && activeMode.refName && (
+        <div className="mt-4 flex items-center gap-2 rounded-lg border border-[#00d992]/30 bg-[#00d992]/5 px-3 py-2 text-[12px] text-[#bdbdbd]">
+          <Sparkles size={14} className="text-[#00d992]" />
+          <span>
+            <span className="font-semibold text-[#00d992]">Vector Search mode:</span> Atlas
+            <span className="font-mono"> $vectorSearch </span>via MCP — finding players tactically
+            similar to <span className="font-semibold text-[#f2f2f2]">{activeMode.refName}</span>
+          </span>
+        </div>
+      )}
+
+      {/* Example queries — only when nothing has streamed yet */}
+      {!showResults && !loading && (
         <div className="mt-5">
           <p className="mb-2.5 text-[11px] font-semibold uppercase tracking-[2.52px] text-[#8b949e]">
             Prueba un ejemplo
@@ -1034,41 +1090,45 @@ export default function ScoutMode() {
         </div>
       )}
 
-      {/* Error */}
       {error && (
         <div className="mt-4 rounded border border-red-400/30 bg-red-500/10 p-4 text-sm text-red-300">
           <strong>Error:</strong> {error}
         </div>
       )}
 
-      {/* Reasoning trace */}
-      {(loading || streamingSteps.length > 0) && (
-        <ReasoningTrace steps={streamingSteps} active={loading} />
+      {(loading || steps.length > 0) && (
+        <ReasoningTrace steps={steps} active={loading} done={done} />
       )}
 
-      {/* Results */}
-      {result && (
+      {showResults && (
         <div className="mt-6 flex flex-col gap-6">
-          {result.players.length > 0 && (
+          {players.length > 0 && (
             <div>
               <h2 className="mb-3 flex items-center gap-2 text-xs font-semibold uppercase tracking-[2.52px] text-[#8b949e]">
                 <Trophy size={14} className="text-[#00d992]" />
-                Top Candidates
+                Top Candidates {loading && players.length > 0 && (
+                  <span className="text-[#bdbdbd] normal-case tracking-normal">
+                    · streaming ({players.length} so far)
+                  </span>
+                )}
               </h2>
               <div className="grid gap-3">
-                {result.players.slice(0, 3).map((player, i) => (
-                  <PlayerCard key={player.id} player={player} rank={i + 1} />
+                {players.slice(0, 5).map((player, i) => (
+                  <PlayerCard
+                    key={player.id}
+                    player={player}
+                    rank={i + 1}
+                    onFindSimilar={done && !loading ? handleFindSimilar : undefined}
+                  />
                 ))}
               </div>
             </div>
           )}
 
-          {result.scouting_report && (
-            <ScoutingReport report={result.scouting_report} />
-          )}
+          {report && <ScoutingReport report={report} streaming={loading} />}
 
-          {judgesMode && result.debug_info && (
-            <DebugPanel info={result.debug_info} />
+          {judgesMode && (steps.length > 0 || players.length > 0) && (
+            <AgentPanel steps={steps} players={players} toolCalls={toolCalls} />
           )}
         </div>
       )}

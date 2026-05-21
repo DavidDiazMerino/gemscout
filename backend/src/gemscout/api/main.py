@@ -17,7 +17,7 @@ import httpx
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from gemscout.agent.tools import (
@@ -678,11 +678,11 @@ async def _call_adk_scout(
 @app.post("/agent/scout", response_model=ScoutResponse)
 async def agent_scout(body: ScoutRequest, request: Request):
     """
-    Main GemScout scouting endpoint.
+    Main GemScout scouting endpoint (non-streaming fallback).
 
-    Routes through the ADK agent (Gemini 2.5 Flash) which uses the official
-    @mongodb-js/mongodb-mcp-server partner MCP server to query MongoDB Atlas.
-    All MongoDB operations go through the partner MCP server.
+    Routes through the ADK agent (Gemini 3 Pro) using the official
+    @mongodb-js/mongodb-mcp-server partner MCP server.
+    Prefer /agent/scout/stream for real-time UX.
     """
     client_ip = request.client.host if request.client else "unknown"
     _check_rate_limit(client_ip)
@@ -708,233 +708,452 @@ async def agent_scout(body: ScoutRequest, request: Request):
         logger.error("ADK agent call failed: %s", exc)
         raise HTTPException(status_code=502, detail=f"Agent unavailable: {exc}")
 
-    # ── Legacy fallback (kept for reference, never reached) ──────────────────
-    americas_requested = intent.get("americas_requested", False)
-    reasoning: list[ReasoningStep] = []
-    tool_calls: list[str] = []
-    step_timing: dict[str, float] = {}
-    step = 0
 
-    # Step 1: Semantic search via Voyage AI + Atlas Vector Search
-    step += 1
-    detail_parts = [
-        f"Translating query to a tactical embedding via Voyage AI (voyage-3-large), "
-        f"querying MongoDB Atlas Vector Search (index: player_embedding_index, "
-        f"numCandidates: {body.limit * 2 * 20}, post-filtering)"
-    ]
-    if position:
-        detail_parts.append(f"— position filter: {position}")
-    if max_age:
-        detail_parts.append(f"— age filter: ≤{max_age}")
-    if league_slug:
-        detail_parts.append(f"— league: {league_slug}")
-    reasoning.append(ReasoningStep(
-        step=step,
-        action="semantic_player_search",
-        detail=" ".join(detail_parts),
-    ))
-    tool_calls.append("semantic_player_search")
+async def _adk_event_stream(user_message: str):
+    """
+    Generator that drives the ADK agent via /run_sse and yields our own SSE
+    payloads (JSON-encoded). Shared by /agent/scout/stream and
+    /agent/scout/similar/stream.
+    """
+    def sse(payload: dict) -> str:
+        return f"data: {_json.dumps(payload)}\n\n"
 
-    _t = perf_counter()
+    step_idx = 0
+    seen_qids: set[str] = set()
+
     try:
-        semantic_results = await semantic_player_search(
-            query=body.query,
-            position=position,
-            max_age=max_age,
-            min_age=min_age,
-            league_tier_max=league_tier_max,
-            league_tier_min=league_tier_min,
-            league_slug=league_slug,
-            season=body.season,
-            limit=body.limit * 2,
-        )
-        top_score = semantic_results[0].vector_score if semantic_results else 0
-        reasoning[-1].result_summary = (
-            f"Atlas returned {len(semantic_results)} semantic matches. "
-            f"Top: {semantic_results[0].name} (similarity {top_score:.3f})"
-            if semantic_results else "No semantic matches"
-        )
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            sess = await client.post(
+                f"{ADK_AGENT_BASE}/apps/gemscout_agent/users/gemscout/sessions",
+                json={},
+            )
+            sess.raise_for_status()
+            session_id = sess.json()["id"]
+
+            async with client.stream(
+                "POST",
+                f"{ADK_AGENT_BASE}/run_sse",
+                json={
+                    "app_name": "gemscout_agent",
+                    "user_id": "gemscout",
+                    "session_id": session_id,
+                    "new_message": {
+                        "role": "user",
+                        "parts": [{"text": user_message}],
+                    },
+                    "streaming": True,
+                },
+                headers={"Accept": "text/event-stream"},
+            ) as resp:
+                if resp.status_code != 200:
+                    body_bytes = await resp.aread()
+                    yield sse({"type": "error", "message": f"ADK /run_sse returned {resp.status_code}: {body_bytes.decode()[:200]}"})
+                    return
+
+                async for raw_line in resp.aiter_lines():
+                    if not raw_line or not raw_line.startswith("data: "):
+                        continue
+                    try:
+                        event = _json.loads(raw_line[6:])
+                    except Exception:
+                        continue
+
+                    author = event.get("author", "")
+                    for part in event.get("content", {}).get("parts", []):
+                        if "functionCall" in part:
+                            fc = part["functionCall"]
+                            step_idx += 1
+                            args_preview = _json.dumps(fc.get("args", {}))[:400]
+                            yield sse({
+                                "type": "step_start",
+                                "step": step_idx,
+                                "action": f"mcp:{fc['name']}",
+                                "detail": f"MCP tool call → {fc['name']}({args_preview})",
+                            })
+
+                        elif "functionResponse" in part:
+                            resp_data = part["functionResponse"]
+                            tool_name = resp_data.get("name", "")
+                            content_items = resp_data.get("response", {}).get("content", [])
+                            summary = ""
+                            docs_streamed = 0
+                            for item in content_items:
+                                text = item.get("text", "")
+                                if not text:
+                                    continue
+                                if text.startswith("{") and '"name"' in text:
+                                    try:
+                                        doc = _json.loads(text)
+                                        qid = doc.get("_id") or doc.get("qid", "")
+                                        if qid and qid not in seen_qids:
+                                            seen_qids.add(qid)
+                                            player_dict = _adk_doc_to_player(doc)
+                                            yield sse({"type": "player", "player": player_dict})
+                                            docs_streamed += 1
+                                    except Exception:
+                                        pass
+                                elif text.startswith("Found"):
+                                    summary = text
+
+                            if not summary and docs_streamed > 0:
+                                summary = f"Streamed {docs_streamed} player document(s)"
+                            yield sse({
+                                "type": "step_done",
+                                "step": step_idx,
+                                "tool": tool_name,
+                                "result_summary": summary or "completed",
+                            })
+
+                        elif "text" in part and author == "gemscout":
+                            yield sse({"type": "text", "chunk": part["text"]})
+
+                yield sse({"type": "done"})
+
     except Exception as exc:
-        logger.warning("semantic_search failed: %s", exc)
-        semantic_results = []
-        reasoning[-1].result_summary = f"Vector search unavailable — falling back to quantitative filter ({exc})"
-    step_timing["semantic_search"] = round((perf_counter() - _t) * 1000, 1)
+        logger.error("Streaming agent call failed: %s", exc)
+        yield sse({"type": "error", "message": str(exc)})
 
-    # Step 2: Quantitative cross-validation
-    step += 1
-    filter_desc_parts = ["Applying hard filters to cross-validate semantic candidates:"]
+
+_SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "X-Accel-Buffering": "no",
+    "Connection": "keep-alive",
+}
+
+
+@app.post("/agent/scout/stream")
+async def agent_scout_stream(body: ScoutRequest, request: Request):
+    """
+    Streaming version of /agent/scout. Emits SSE events as the ADK agent runs.
+
+    Event types (JSON in `data:` field):
+      {"type": "step_start", "step": int, "action": str, "detail": str}
+      {"type": "step_done",  "step": int, "result_summary": str}
+      {"type": "player",     "player": {...}}
+      {"type": "text",       "chunk": str}
+      {"type": "done"}
+      {"type": "error",      "message": str}
+    """
+    client_ip = request.client.host if request.client else "unknown"
+    _check_rate_limit(client_ip)
+
+    intent = _parse_query_intent(body.query)
+    position = body.position or intent.get("position")
+    max_age = body.max_age if body.max_age is not None else intent.get("max_age")
+    min_age = body.min_age
+    league_tier_max = body.league_tier_max if body.league_tier_max is not None else intent.get("league_tier_max")
+    league_slug = body.league_slug or intent.get("league_slug")
+
+    parts: list[str] = [body.query.strip()]
     if position:
-        filter_desc_parts.append(f"position={position}")
+        parts.append(f"Position filter: {position}.")
     if max_age:
-        filter_desc_parts.append(f"max_age={max_age}")
+        parts.append(f"Max age: {max_age}.")
+    if min_age:
+        parts.append(f"Min age: {min_age}.")
     if league_slug:
-        filter_desc_parts.append(f"league={league_slug}")
-    filter_desc_parts.append("sorted by statistical dominance")
-    reasoning.append(ReasoningStep(
-        step=step,
-        action="filter_players",
-        detail=" ".join(filter_desc_parts),
-    ))
-    tool_calls.append("filter_players")
+        parts.append(f"League: {league_slug}.")
+    if league_tier_max:
+        parts.append(f"Max league tier: {league_tier_max} (1=Big-5, 2=Strong EU, 3=Americas).")
+    user_message = " ".join(parts)
 
-    _t = perf_counter()
-    quant_results = await filter_players(
-        position=position,
-        max_age=max_age,
-        min_age=min_age,
-        league_tier_max=league_tier_max,
-        league_tier_min=league_tier_min,
-        league_slug=league_slug,
-        season=body.season,
-        limit=20,
-    )
-    step_timing["quant_filter"] = round((perf_counter() - _t) * 1000, 1)
-
-    seen_qids = {p.qid for p in semantic_results}
-    merged = list(semantic_results)
-    for p in quant_results:
-        if p.qid not in seen_qids:
-            merged.append(p)
-    final_players = merged[: body.limit]
-
-    reasoning[-1].result_summary = (
-        f"Quantitative filter: {len(quant_results)} players. "
-        f"Semantic-only: {len(semantic_results)}, quant-only additions: {len(merged) - len(semantic_results)}. "
-        f"Final pool: {len(final_players)} candidates."
+    return StreamingResponse(
+        _adk_event_stream(user_message),
+        media_type="text/event-stream",
+        headers=_SSE_HEADERS,
     )
 
-    # Step 3: Rank by combined score
-    step += 1
-    reasoning.append(ReasoningStep(
-        step=step,
-        action="rank_candidates",
-        detail="Combined score = 60% semantic similarity + 40% position-specific stat percentile",
-    ))
-    tool_calls.append("rank_candidates")
 
-    def combined_score(p: PlayerResult) -> float:
-        norm = p.metrics_normalized
-        if p.position == "GK":
-            keys = ["save_percent", "goals_prevented", "clean_sheets"]
-        elif p.position == "DEF":
-            keys = ["xg_chain", "xg_buildup", "key_passes", "minutes"]
-        elif p.position == "MID":
-            keys = ["xa", "key_passes", "xg_chain", "xg_buildup"]
-        else:
-            keys = ["xg", "xa", "key_passes", "xg_chain"]
-        stat_score = sum(norm.get(k) or 0 for k in keys) / len(keys)
-        vec = (p.vector_score or 0) * 100
-        return vec * 0.6 + stat_score * 0.4
+# ── Similar Players via Atlas Vector Search through MCP ───────────────────
 
-    final_players.sort(key=combined_score, reverse=True)
-    top3 = final_players[:3]
+class SimilarRequest(BaseModel):
+    qid: str = Field(min_length=1, max_length=64)
+    debug_mode: bool = False
 
-    reasoning[-1].result_summary = (
-        f"Final ranking: "
-        + ", ".join(
-            f"{p.name} ({combined_score(p):.1f})"
-            for p in top3
+
+def _player_pct(norm: dict, key: str) -> str:
+    v = norm.get(key)
+    return f"{round(v)}th" if v is not None else "—"
+
+
+def _format_player_for_comparison(p: dict, original_name: str) -> str:
+    """Compact text representation of a player for the agent's comparison prompt."""
+    norm = p.get("metrics_normalized") or {}
+    stats = p.get("stats") or {}
+    history = p.get("history") or {}
+
+    trend_lines = []
+    for season in sorted(history.keys()):
+        h_norm = history[season].get("metrics_normalized") or {}
+        if h_norm:
+            top_keys = ["xg", "xa", "key_passes", "xg_chain", "save_percent", "goals_prevented"]
+            present = [f"{k}={round(h_norm[k])}th" for k in top_keys if h_norm.get(k) is not None]
+            if present:
+                trend_lines.append(f"    {season}: " + ", ".join(present))
+
+    score = p.get("score") or 0.0
+    raw_stat = lambda k: f"{stats[k]:.2f}" if isinstance(stats.get(k), (int, float)) else "—"
+
+    history_block = ("  history (percentile trajectory):\n" + "\n".join(trend_lines)) if trend_lines else ""
+
+    return (
+        f"- name: {p.get('name')}\n"
+        f"  qid: {p.get('qid') or p.get('_id')}\n"
+        f"  team: {p.get('current_team')} · league: {p.get('league')} (tier {p.get('league_tier')})\n"
+        f"  position: {p.get('position')} · age: {p.get('age')} · nationality: {p.get('nationality')}\n"
+        f"  market_value_eur: {p.get('market_value_eur')}\n"
+        f"  vector_similarity_to_{original_name.replace(' ', '_')}: {score:.4f}\n"
+        f"  key_percentiles: xg={_player_pct(norm, 'xg')} xa={_player_pct(norm, 'xa')} "
+        f"key_passes={_player_pct(norm, 'key_passes')} xg_chain={_player_pct(norm, 'xg_chain')} "
+        f"xg_buildup={_player_pct(norm, 'xg_buildup')} npxg={_player_pct(norm, 'npxg')}\n"
+        f"  raw_stats: xg={raw_stat('xg')} xa={raw_stat('xa')} goals={raw_stat('goals')} assists={raw_stat('assists')}\n"
+        + history_block
+    )
+
+
+async def _similar_event_stream(qid: str):
+    """
+    Server-side pipeline:
+      1. Read seed player's embedding from MongoDB
+      2. Run $vectorSearch via pymongo (fast, reliable — no LLM in the loop)
+      3. Emit synthetic "tool call" events so the UI shows the pipeline
+      4. Stream similar players as cards
+      5. Have the agent write the comparison dossier (text only, no tool calls)
+
+    Passing a 1536-float queryVector through Gemini's tool calling is brittle —
+    the model is asked to copy the array verbatim and timeouts the MCP SSE.
+    Doing $vectorSearch server-side keeps Atlas Vector Search demonstrable while
+    letting the agent do what it's good at: comparative reasoning.
+    """
+    def sse(payload: dict) -> str:
+        return f"data: {_json.dumps(payload)}\n\n"
+
+    try:
+        db = get_async_db()
+
+        seed = await db[PLAYERS_COLLECTION].find_one(
+            {"_id": qid},
+            {"embedding": 1, "name": 1, "position": 1, "current_team": 1, "nationality": 1, "age": 1},
         )
-    )
+        if not seed:
+            yield sse({"type": "error", "message": f"Player {qid} not found"})
+            return
+        embedding = seed.get("embedding")
+        if not embedding:
+            yield sse({"type": "error", "message": f"Player {qid} has no embedding indexed"})
+            return
 
-    # Step 4: Generate Gemini scouting report
-    step += 1
-    reasoning.append(ReasoningStep(
-        step=step,
-        action="generate_scouting_report",
-        detail=f"Sending top-3 profiles to {settings.gemini_model} — structured scouting dossier format",
-    ))
-    tool_calls.append("generate_scouting_report")
+        seed_name = seed.get("name", "?")
+        seed_position = seed.get("position", "?")
+        seed_team = seed.get("current_team", "?")
+        seed_nationality = seed.get("nationality", "?")
+        seed_age = seed.get("age", "?")
 
-    data_note = (
-        "Database covers European leagues (2025-26 season). "
-        "No Americas/CONMEBOL league data indexed. "
-        "South American players shown are based at European clubs."
-    ) if americas_requested else ""
+        # Emit a synthetic step so the UI shows the actual pipeline (with placeholder for the
+        # huge embedding so the trace stays readable). The real pipeline runs below.
+        display_pipeline = [
+            {"$vectorSearch": {
+                "index": "player_embedding_index",
+                "path": "embedding",
+                "queryVector": f"<1536-dim embedding of {seed_name}>",
+                "numCandidates": 100,
+                "limit": 5,
+                "filter": {"_id": {"$ne": qid}},
+            }},
+            {"$project": {"qid": 1, "name": 1, "score": {"$meta": "vectorSearchScore"}, "stats": 1, "metrics_normalized": 1, "history": 1}},
+        ]
+        yield sse({
+            "type": "step_start",
+            "step": 1,
+            "action": "mcp:aggregate",
+            "detail": f"Atlas $vectorSearch on player_embedding_index ({_json.dumps(display_pipeline)})",
+        })
 
-    _t = perf_counter()
-    scouting_report = await _generate_scouting_report(
-        body.query, top3, body.world_cup_context, data_note=data_note
-    )
-    step_timing["report_generation"] = round((perf_counter() - _t) * 1000, 1)
+        # Execute the real $vectorSearch
+        real_pipeline = [
+            {"$vectorSearch": {
+                "index": "player_embedding_index",
+                "path": "embedding",
+                "queryVector": embedding,
+                "numCandidates": 100,
+                "limit": 5,
+                "filter": {"_id": {"$ne": qid}},
+            }},
+            {"$project": {
+                "qid": 1, "name": 1, "nationality": 1, "position": 1, "age": 1,
+                "current_team": 1, "league": 1, "league_tier": 1,
+                "stats": 1, "metrics_normalized": 1, "profile_text": 1,
+                "market_value_eur": 1, "season": 1, "history": 1,
+                "score": {"$meta": "vectorSearchScore"},
+            }},
+        ]
+        cursor = db[PLAYERS_COLLECTION].aggregate(real_pipeline)
+        similar_docs: list[dict] = []
+        async for doc in cursor:
+            similar_docs.append(doc)
 
-    reasoning[-1].result_summary = (
-        f"Dossier generated — {len(scouting_report)} chars, "
-        f"{step_timing['report_generation']}ms"
-    )
+        yield sse({
+            "type": "step_done",
+            "step": 1,
+            "tool": "aggregate",
+            "result_summary": f"Found {len(similar_docs)} similar players via $vectorSearch",
+        })
 
-    players_out = [_player_to_dict(p) for p in final_players]
+        if not similar_docs:
+            yield sse({"type": "text", "chunk": f"No players similar to {seed_name} were found."})
+            yield sse({"type": "done"})
+            return
 
-    # Build debug info for judges panel
-    debug_info = None
-    if body.debug_mode:
-        def _stat_score_debug(p: PlayerResult) -> float:
-            if p.position == "GK":
-                keys = ["save_percent", "goals_prevented", "clean_sheets"]
-            elif p.position == "DEF":
-                keys = ["xg_chain", "xg_buildup", "key_passes", "minutes"]
-            elif p.position == "MID":
-                keys = ["xa", "key_passes", "xg_chain", "xg_buildup"]
-            else:
-                keys = ["xg", "xa", "key_passes", "xg_chain"]
-            vals = [float(p.metrics_normalized.get(k) or 0) for k in keys]
-            return round(sum(vals) / len(vals), 1)
+        # Stream each similar player to the UI
+        for d in similar_docs:
+            player_dict = _adk_doc_to_player(d)
+            # Attach vectorSearchScore so the UI can show it if needed
+            player_dict["vector_score"] = d.get("score")
+            yield sse({"type": "player", "player": player_dict})
 
-        debug_info = DebugInfo(
-            query_intent={
-                "detected_position": intent.get("position") or "—",
-                "applied_position": position or "—",
-                "detected_max_age": intent.get("max_age") or "—",
-                "applied_max_age": max_age or "—",
-                "detected_league": intent.get("league_slug") or "—",
-                "applied_league": league_slug or "—",
-                "americas_league_flag": intent.get("americas_requested", False),
-            },
-            filters_applied={
-                "position": position,
-                "max_age": max_age,
-                "league_tier_max": league_tier_max,
-                "league_tier_min": league_tier_min,
-                "league_slug": league_slug,
-                "season": body.season,
-                "db_pool": "~2,200 players (Big-5 + Mid-Europe, 2025-26)",
-            },
-            semantic_candidates=[
-                {
-                    "name": p.name,
-                    "team": p.team,
-                    "league": p.league,
-                    "age": p.age,
-                    "position": p.position,
-                    "vector_score": round(p.vector_score or 0, 4),
-                }
-                for p in semantic_results
-            ],
-            quant_candidates_count=len(quant_results),
-            final_ranking=[
-                {
-                    "name": p.name,
-                    "team": p.team,
-                    "vector_score": round(p.vector_score or 0, 4),
-                    "stat_score": _stat_score_debug(p),
-                    "combined_score": round(combined_score(p), 2),
-                }
-                for p in final_players
-            ],
-            timing_ms=step_timing,
-            vector_index="player_embedding_index",
-            embedding_model="voyage-3-large",
-            llm_model=settings.gemini_model,
+        # Now hand the candidates to the agent for the comparison dossier
+        context_lines = "\n".join(_format_player_for_comparison(d, seed_name) for d in similar_docs)
+        user_message = (
+            f"You ran Atlas Vector Search ($vectorSearch on 1536-dim profile embeddings) "
+            f"and found 5 players tactically similar to "
+            f"{seed_name} ({seed_position}, {seed_team}, {seed_nationality}, {seed_age}y). "
+            f"Higher vector_similarity score = more tactically alike.\n\n"
+            f"CANDIDATES:\n{context_lines}\n\n"
+            f"Write a SCOUTING COMPARISON DOSSIER. For each candidate, use this exact format:\n\n"
+            f"## [Name] · [Club] · [Nationality] · [Age]y\n\n"
+            f"TACTICAL VERDICT:\nOne opinionated sentence on what kind of player they are.\n\n"
+            f"VS {seed_name.upper()}:\n"
+            f"- Vector similarity: [score × 100]/100\n"
+            f"- What they share (cite percentiles)\n"
+            f"- Where they differ (cite percentiles)\n\n"
+            f"KEY STRENGTHS:\n- [3 bullets backed by percentiles]\n\n"
+            f"RISK FLAGS:\n- [league level, minutes, age, adaptation]\n\n"
+            f"WORLD CUP CYCLE TREND:\n"
+            f"- [trajectory across 2023-24 → 2024-25 → 2025-26, cite percentiles]\n\n"
+            f"WORLD CUP 2026 VERDICT: starter / impact substitute / squad depth.\n\n"
+            f"RECOMMENDATION: SIGN NOW / TRACK CLOSELY / MONITOR / PASS\n"
+            f"CONFIDENCE: HIGH / MEDIUM / LOW — one-sentence reason.\n\n"
+            f"DO NOT call any tools — write the dossier directly from the data above."
         )
 
-    return ScoutResponse(
-        query=body.query,
-        reasoning_steps=reasoning,
-        players=players_out,
-        scouting_report=scouting_report,
-        tool_calls=tool_calls,
-        debug_info=debug_info,
+        step_idx = 1
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            sess = await client.post(
+                f"{ADK_AGENT_BASE}/apps/gemscout_agent/users/gemscout/sessions",
+                json={},
+            )
+            sess.raise_for_status()
+            session_id = sess.json()["id"]
+
+            async with client.stream(
+                "POST",
+                f"{ADK_AGENT_BASE}/run_sse",
+                json={
+                    "app_name": "gemscout_agent",
+                    "user_id": "gemscout",
+                    "session_id": session_id,
+                    "new_message": {"role": "user", "parts": [{"text": user_message}]},
+                    "streaming": True,
+                },
+                headers={"Accept": "text/event-stream"},
+            ) as resp:
+                if resp.status_code != 200:
+                    body_bytes = await resp.aread()
+                    yield sse({"type": "error", "message": f"ADK returned {resp.status_code}: {body_bytes.decode()[:200]}"})
+                    return
+
+                wrote_writing_step = False
+                async for raw_line in resp.aiter_lines():
+                    if not raw_line or not raw_line.startswith("data: "):
+                        continue
+                    try:
+                        event = _json.loads(raw_line[6:])
+                    except Exception:
+                        continue
+
+                    author = event.get("author", "")
+                    for part in event.get("content", {}).get("parts", []):
+                        if "text" in part and author == "gemscout" and part["text"]:
+                            if not wrote_writing_step:
+                                step_idx += 1
+                                yield sse({
+                                    "type": "step_start",
+                                    "step": step_idx,
+                                    "action": "writing",
+                                    "detail": "Gemini 3 Pro composing comparison dossier from $vectorSearch results",
+                                })
+                                wrote_writing_step = True
+                            yield sse({"type": "text", "chunk": part["text"]})
+
+                if wrote_writing_step:
+                    yield sse({
+                        "type": "step_done",
+                        "step": step_idx,
+                        "tool": "gemini",
+                        "result_summary": "Comparison dossier complete",
+                    })
+
+        yield sse({"type": "done"})
+
+    except Exception as exc:
+        logger.error("Similar players stream failed", exc_info=True)
+        yield sse({"type": "error", "message": str(exc) or repr(exc) or "unknown error"})
+
+
+@app.post("/agent/scout/similar/stream")
+async def agent_scout_similar_stream(body: SimilarRequest, request: Request):
+    """
+    Streams a "similar players" query.
+
+    $vectorSearch on the 1536-dim profile embeddings is executed server-side via
+    pymongo (fast and reliable), and the agent then writes the comparison
+    dossier. Emits the same SSE protocol as /agent/scout/stream so the frontend
+    can reuse the same consumer.
+    """
+    client_ip = request.client.host if request.client else "unknown"
+    _check_rate_limit(client_ip)
+
+    return StreamingResponse(
+        _similar_event_stream(body.qid),
+        media_type="text/event-stream",
+        headers=_SSE_HEADERS,
     )
+
+
+def _adk_doc_to_player(doc: dict) -> dict:
+    """Convert a raw MongoDB doc (from MCP) to the player dict the frontend expects."""
+    qid = doc.get("_id") or doc.get("qid", "")
+    norm = doc.get("metrics_normalized") or {}
+    position_doc = doc.get("position", "")
+    history = doc.get("history") or {}
+    stats = doc.get("stats") or {}
+    season_doc = doc.get("season", "2025-26")
+
+    trend = _compute_trend(
+        _position_score(norm, position_doc),
+        season_doc,
+        history,
+        position_doc,
+        stats.get("minutes"),
+    )
+    return {
+        "id": qid,
+        "name": doc.get("name", ""),
+        "age": doc.get("age", 0),
+        "position": position_doc,
+        "nationality": doc.get("nationality", ""),
+        "current_team": doc.get("current_team", ""),
+        "league": doc.get("league", ""),
+        "league_tier": doc.get("league_tier", 0),
+        "season": season_doc,
+        "stats": stats,
+        "metrics_normalized": norm,
+        "market_value_eur": doc.get("market_value_eur"),
+        "vector_score": None,
+        "profile_text": doc.get("profile_text", ""),
+        "trend": trend,
+    }
+
 
 
 async def _generate_scouting_report(

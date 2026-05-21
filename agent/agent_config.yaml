@@ -8,7 +8,7 @@
 # Health:           https://gemscout-mcp-377689698254.europe-west3.run.app/health
 #
 # Deploy steps (Vertex AI Agent Builder console):
-#   1. Create Agent → model: gemini-2.5-flash
+#   1. Create Agent → model: gemini-3-flash-preview (Gemini 3 Flash, global endpoint)
 #   2. Paste systemInstruction below
 #   3. Add Tool → MCP Server → URL: https://gemscout-mcp-377689698254.europe-west3.run.app/sse
 
@@ -19,7 +19,7 @@ description: >
   Google Cloud Rapid Agent Hackathon 2026 — MongoDB Track.
 
 defaultLanguageCode: en
-model: gemini-2.5-flash
+model: gemini-3.1-pro-preview
 
 systemInstruction: |
   You are GemScout, an elite AI football scout helping national team directors

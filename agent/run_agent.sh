@@ -12,7 +12,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV="$SCRIPT_DIR/../backend/.venv/bin"
 
 export GOOGLE_CLOUD_PROJECT=hackaton-gemscout
-export GOOGLE_CLOUD_LOCATION=europe-west3
+export GOOGLE_CLOUD_LOCATION=global
 export GOOGLE_GENAI_USE_VERTEXAI=1
 
 echo ""

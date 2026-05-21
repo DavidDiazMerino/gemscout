@@ -123,7 +123,10 @@ Step 3 — WRITE SCOUTING DOSSIER
 
 root_agent = LlmAgent(
     name="gemscout",
-    model="gemini-2.5-flash",
+    # Gemini 3 Flash mangles $-prefixed JSON keys ($search → Sl_search, $match → "\"$match\"").
+    # Pro (3.1) handles MongoDB aggregate pipelines correctly.
+    model="gemini-3.1-pro-preview",
+
     description=(
         "Elite AI football scout for FIFA World Cup 2026. "
         "Queries a MongoDB Atlas database of 2,200+ players using "
@@ -134,8 +137,10 @@ root_agent = LlmAgent(
         MCPToolset(
             connection_params=SseConnectionParams(
                 url=MCP_SSE_URL,
-                timeout=30.0,
-                sse_read_timeout=60.0,
+                timeout=60.0,
+                # $vectorSearch with a 1536-dim queryVector takes longer over SSE,
+                # so we allow a generous window for the MCP partner server to reply.
+                sse_read_timeout=180.0,
             )
         )
     ],
