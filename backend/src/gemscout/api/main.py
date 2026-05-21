@@ -724,6 +724,11 @@ async def _adk_event_stream(user_message: str):
     # ADK emits the functionCall in two events: first as a standalone call, then
     # bundled with the functionResponse. We only want one step_start per call.
     pending_steps: dict[str, int] = {}  # fc_id → step_idx
+    # Track accumulated report text to detect the ADK's final "complete dump".
+    # ADK streams tokens incrementally, then re-emits the full assembled response
+    # as the last event before closing the SSE stream. We detect this by checking
+    # if a single chunk is suspiciously large relative to what we've already emitted.
+    total_text_chars = 0
 
     try:
         async with httpx.AsyncClient(timeout=180.0) as client:
@@ -820,7 +825,21 @@ async def _adk_event_stream(user_message: str):
                             })
 
                         elif "text" in part and author == "gemscout":
-                            yield sse({"type": "text", "chunk": part["text"]})
+                            chunk = part["text"]
+                            # Skip the ADK's final complete-text dump.
+                            # During streaming the ADK sends many small chunks (10-150 chars),
+                            # then after the stream closes it re-emits the full assembled
+                            # response in one big event. We detect this: if we've already
+                            # streamed > 300 chars and this single chunk is > 40% of that
+                            # total, it's the final dump — drop it to avoid doubling.
+                            if chunk and total_text_chars > 300 and len(chunk) > total_text_chars * 0.4:
+                                logger.debug(
+                                    "Skipping ADK final text dump (%d chars, total_so_far=%d)",
+                                    len(chunk), total_text_chars,
+                                )
+                            else:
+                                total_text_chars += len(chunk)
+                                yield sse({"type": "text", "chunk": chunk})
 
                 yield sse({"type": "done"})
 
@@ -929,16 +948,15 @@ def _format_player_for_comparison(p: dict, original_name: str) -> str:
 async def _similar_event_stream(qid: str):
     """
     Server-side pipeline:
-      1. Read seed player's embedding from MongoDB
-      2. Run $vectorSearch via pymongo (fast, reliable — no LLM in the loop)
+      1. Read seed player's profile_text from MongoDB
+      2. Run Atlas $search (moreLikeThis) to find tactically similar players
       3. Emit synthetic "tool call" events so the UI shows the pipeline
       4. Stream similar players as cards
       5. Have the agent write the comparison dossier (text only, no tool calls)
 
-    Passing a 1536-float queryVector through Gemini's tool calling is brittle —
-    the model is asked to copy the array verbatim and timeouts the MCP SSE.
-    Doing $vectorSearch server-side keeps Atlas Vector Search demonstrable while
-    letting the agent do what it's good at: comparative reasoning.
+    Uses Atlas $search (moreLikeThis) rather than $vectorSearch so the result
+    is independent of the embedding dimension stored in the Atlas Vector Search
+    index — avoids the "1536 vs 1024 dimension mismatch" error.
     """
     def sse(payload: dict) -> str:
         return f"data: {_json.dumps(payload)}\n\n"
@@ -948,58 +966,58 @@ async def _similar_event_stream(qid: str):
 
         seed = await db[PLAYERS_COLLECTION].find_one(
             {"_id": qid},
-            {"embedding": 1, "name": 1, "position": 1, "current_team": 1, "nationality": 1, "age": 1},
+            {"profile_text": 1, "name": 1, "position": 1,
+             "current_team": 1, "nationality": 1, "age": 1},
         )
         if not seed:
             yield sse({"type": "error", "message": f"Player {qid} not found"})
             return
-        embedding = seed.get("embedding")
-        if not embedding:
-            yield sse({"type": "error", "message": f"Player {qid} has no embedding indexed"})
-            return
 
+        profile_text = seed.get("profile_text", "")
         seed_name = seed.get("name", "?")
         seed_position = seed.get("position", "?")
         seed_team = seed.get("current_team", "?")
         seed_nationality = seed.get("nationality", "?")
         seed_age = seed.get("age", "?")
 
-        # Emit a synthetic step so the UI shows the actual pipeline (with placeholder for the
-        # huge embedding so the trace stays readable). The real pipeline runs below.
+        if not profile_text:
+            yield sse({"type": "error", "message": f"Player {qid} has no profile text indexed"})
+            return
+
+        # Emit a synthetic step showing the Atlas Search pipeline
         display_pipeline = [
-            {"$vectorSearch": {
-                "index": "player_embedding_index",
-                "path": "embedding",
-                "queryVector": f"<1536-dim embedding of {seed_name}>",
-                "numCandidates": 100,
-                "limit": 5,
-                "filter": {"_id": {"$ne": qid}},
+            {"$search": {
+                "index": "player_text_index",
+                "moreLikeThis": {
+                    "like": [{"profile_text": f"<profile of {seed_name}>"}]
+                }
             }},
-            {"$project": {"qid": 1, "name": 1, "score": {"$meta": "vectorSearchScore"}, "stats": 1, "metrics_normalized": 1, "history": 1}},
+            {"$match": {"_id": {"$ne": qid}, "position": seed_position}},
+            {"$limit": 5},
         ]
         yield sse({
             "type": "step_start",
             "step": 1,
             "action": "mcp:aggregate",
-            "detail": f"Atlas $vectorSearch on player_embedding_index ({_json.dumps(display_pipeline)})",
+            "detail": f"Atlas $search (moreLikeThis) on player_text_index — finding players tactically similar to {seed_name} ({_json.dumps(display_pipeline)})",
         })
 
-        # Execute the real $vectorSearch
+        # Execute Atlas $search moreLikeThis
         real_pipeline = [
-            {"$vectorSearch": {
-                "index": "player_embedding_index",
-                "path": "embedding",
-                "queryVector": embedding,
-                "numCandidates": 100,
-                "limit": 5,
-                "filter": {"_id": {"$ne": qid}},
+            {"$search": {
+                "index": "player_text_index",
+                "moreLikeThis": {
+                    "like": [{"profile_text": profile_text}]
+                }
             }},
+            {"$match": {"_id": {"$ne": qid}, "position": seed_position}},
+            {"$limit": 6},
             {"$project": {
                 "qid": 1, "name": 1, "nationality": 1, "position": 1, "age": 1,
                 "current_team": 1, "league": 1, "league_tier": 1,
                 "stats": 1, "metrics_normalized": 1, "profile_text": 1,
                 "market_value_eur": 1, "season": 1, "history": 1,
-                "score": {"$meta": "vectorSearchScore"},
+                "score": {"$meta": "searchScore"},
             }},
         ]
         cursor = db[PLAYERS_COLLECTION].aggregate(real_pipeline)
@@ -1007,11 +1025,14 @@ async def _similar_event_stream(qid: str):
         async for doc in cursor:
             similar_docs.append(doc)
 
+        # Limit to 5 results
+        similar_docs = similar_docs[:5]
+
         yield sse({
             "type": "step_done",
             "step": 1,
             "tool": "aggregate",
-            "result_summary": f"Found {len(similar_docs)} similar players via $vectorSearch",
+            "result_summary": f"Found {len(similar_docs)} similar players via Atlas $search (moreLikeThis)",
         })
 
         if not similar_docs:
@@ -1029,10 +1050,10 @@ async def _similar_event_stream(qid: str):
         # Now hand the candidates to the agent for the comparison dossier
         context_lines = "\n".join(_format_player_for_comparison(d, seed_name) for d in similar_docs)
         user_message = (
-            f"You ran Atlas Vector Search ($vectorSearch on 1536-dim profile embeddings) "
-            f"and found 5 players tactically similar to "
+            f"You ran Atlas $search (moreLikeThis on profile_text embeddings via player_text_index) "
+            f"and found {len(similar_docs)} players tactically similar to "
             f"{seed_name} ({seed_position}, {seed_team}, {seed_nationality}, {seed_age}y). "
-            f"Higher vector_similarity score = more tactically alike.\n\n"
+            f"Higher score = more tactically alike.\n\n"
             f"CANDIDATES:\n{context_lines}\n\n"
             f"Write a SCOUTING COMPARISON DOSSIER. For each candidate, use this exact format:\n\n"
             f"## [Name] · [Club] · [Nationality] · [Age]y\n\n"

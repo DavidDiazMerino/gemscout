@@ -408,6 +408,13 @@ function PlayerCard({
         </p>
       )}
 
+      {keyMetrics.length === 0 && (
+        <div className="mb-3 flex items-center gap-2 rounded border border-[#3d3a39] bg-[#101010] px-3 py-2 text-[11px] text-[#8b949e]">
+          <span className="h-2 w-2 rounded-full bg-[#3d3a39]" />
+          Stats not included in this query — click the card to scout further
+        </div>
+      )}
+
       {keyMetrics.length > 0 && (
         <div className="mb-3 grid grid-cols-3 gap-1.5 sm:grid-cols-6">
           {keyMetrics.slice(0, 6).map((m) => {
