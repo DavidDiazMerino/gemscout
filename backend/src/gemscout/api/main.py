@@ -865,6 +865,153 @@ def _player_to_dict(p: PlayerResult) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Individual Agent Builder tools
+# These are the granular endpoints that Agent Builder's Gemini model calls
+# directly — it decides when and how to use each one.
+# ---------------------------------------------------------------------------
+
+class SearchPlayersRequest(BaseModel):
+    query: str = Field(min_length=3, max_length=500, description="Tactical description of the player profile")
+    position: str | None = Field(None, description="FWD, MID, DEF or GK")
+    max_age: int | None = Field(None, description="Maximum player age (inclusive)")
+    min_age: int | None = Field(None, description="Minimum player age (inclusive)")
+    league_tier_max: int | None = Field(None, description="1=Big-5 Europe, 2=Mid Europe, 3=Americas/Other")
+    league_slug: str | None = Field(None, description="Specific league slug e.g. premier-league, la-liga")
+    season: str = Field("2025-26", description="Season to search")
+    limit: int = Field(10, le=20, description="Max players to return")
+
+
+@app.post("/agent/tools/search_players")
+async def tool_search_players(body: SearchPlayersRequest, request: Request):
+    """
+    **Tool: search_players**
+
+    Searches the GemScout database of 2,200+ players using two complementary methods:
+
+    1. **Semantic search** — Voyage AI embeds your query into a 1536-dim vector and
+       runs MongoDB Atlas Vector Search (cosine similarity) to find players whose
+       tactical profiles best match the description.
+
+    2. **Quantitative filter** — applies hard constraints (position, age, league tier)
+       and sorts by position-specific statistical percentile scores.
+
+    Returns up to `limit` ranked players with full stats, percentile scores (0-100),
+    market values, and a 3-season World Cup cycle trend.
+
+    Call this first when the director gives you a player profile to find.
+    """
+    client_ip = request.client.host if request.client else "unknown"
+    _check_rate_limit(client_ip)
+
+    intent = _parse_query_intent(body.query)
+    position = body.position or intent.get("position")
+    max_age = body.max_age if body.max_age is not None else intent.get("max_age")
+    min_age = body.min_age
+    league_tier_max = body.league_tier_max if body.league_tier_max is not None else intent.get("league_tier_max")
+    league_tier_min = intent.get("league_tier_min")
+    league_slug = body.league_slug or intent.get("league_slug")
+
+    _t = perf_counter()
+    semantic_results = await semantic_player_search(
+        query=body.query,
+        position=position,
+        max_age=max_age,
+        min_age=min_age,
+        league_tier_max=league_tier_max,
+        league_tier_min=league_tier_min,
+        league_slug=league_slug,
+        season=body.season,
+        limit=body.limit * 2,
+    )
+    quant_results = await filter_players(
+        position=position,
+        max_age=max_age,
+        min_age=min_age,
+        league_tier_max=league_tier_max,
+        league_tier_min=league_tier_min,
+        league_slug=league_slug,
+        season=body.season,
+        limit=15,
+    )
+    search_ms = round((perf_counter() - _t) * 1000, 1)
+
+    seen = {p.qid for p in semantic_results}
+    merged = list(semantic_results) + [p for p in quant_results if p.qid not in seen]
+
+    def _combined(p: PlayerResult) -> float:
+        norm = p.metrics_normalized
+        keys = (
+            ["save_percent", "goals_prevented", "clean_sheets"] if p.position == "GK"
+            else ["xg_chain", "xg_buildup", "key_passes", "minutes"] if p.position == "DEF"
+            else ["xa", "key_passes", "xg_chain", "xg_buildup"] if p.position == "MID"
+            else ["xg", "xa", "key_passes", "xg_chain"]
+        )
+        stat_score = sum(norm.get(k) or 0 for k in keys) / len(keys)
+        return (p.vector_score or 0) * 100 * 0.6 + stat_score * 0.4
+
+    merged.sort(key=_combined, reverse=True)
+    top = merged[: body.limit]
+
+    return {
+        "query": body.query,
+        "filters_applied": {
+            "position": position, "max_age": max_age, "min_age": min_age,
+            "league_tier_max": league_tier_max, "league_slug": league_slug,
+            "season": body.season,
+        },
+        "search_ms": search_ms,
+        "total_candidates": len(merged),
+        "players": [_player_to_dict(p) for p in top],
+    }
+
+
+@app.get("/agent/tools/player_profile/{qid}")
+async def tool_player_profile(qid: str):
+    """
+    **Tool: player_profile**
+
+    Returns the complete profile for a single player identified by their Wikidata QID.
+
+    Use this after `search_players` when you want to investigate a specific candidate
+    in more depth — full stat breakdown, 3-season World Cup cycle trajectory, market
+    value context, and the raw tactical profile text used for semantic indexing.
+
+    The `trend.values_by_season` field gives you the position-specific percentile score
+    for each season so you can describe whether the player is peaking now or declining.
+    """
+    db = get_async_db()
+    doc = await db[PLAYERS_COLLECTION].find_one({"_id": qid}, {"embedding": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail=f"Player {qid} not found")
+
+    position = doc.get("position", "")
+    norm = doc.get("metrics_normalized", {})
+    history = doc.get("history", {})
+    stats = doc.get("stats", {})
+    season = doc.get("season", "2025-26")
+
+    trend = _compute_trend(_position_score(norm, position), season, history, position, stats.get("minutes"))
+
+    return {
+        "qid": qid,
+        "name": doc.get("name"),
+        "age": doc.get("age"),
+        "position": doc.get("position"),
+        "nationality": doc.get("nationality"),
+        "current_team": doc.get("current_team"),
+        "league": doc.get("league"),
+        "league_tier": doc.get("league_tier"),
+        "season": season,
+        "market_value_eur": doc.get("market_value_eur"),
+        "stats": stats,
+        "metrics_normalized": norm,
+        "profile_text": doc.get("profile_text", ""),
+        "trend": trend,
+        "history_seasons_available": sorted(history.keys()),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Agent Builder tool manifest (Google Cloud Agent Builder reads this)
 # ---------------------------------------------------------------------------
 

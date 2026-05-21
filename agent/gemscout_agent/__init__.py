@@ -59,26 +59,29 @@ No filters (text only):
                   "stats":1,"metrics_normalized":1,"profile_text":1}}
   ]
 
-With filters (embed them in compound):
+With filters (CORRECT pattern — "equals" only works for numbers/booleans in filter):
   pipeline = [
     {"$search": {
       "index": "player_text_index",
       "compound": {
         "must": [{"text": {"query": "<description>", "path": "profile_text"}}],
         "filter": [
-          {"equals": {"path": "position", "value": "MID"}},
-          {"range":  {"path": "age", "lte": 25}},
-          {"range":  {"path": "league_tier", "lte": 2}}
+          {"range": {"path": "age", "lte": 25}},
+          {"range": {"path": "league_tier", "lte": 2}}
         ]
       }
     }},
+    {"$match": {"position": "MID"}},
     {"$limit": 8},
     {"$project": {"qid":1,"name":1,"nationality":1,"position":1,"age":1,
                   "current_team":1,"league":1,"league_tier":1,
                   "stats":1,"metrics_normalized":1,"profile_text":1}}
   ]
 
-String fields → "equals". Numeric fields (age, league_tier) → "range".
+RULES for Atlas Search filters:
+- "range" in compound.filter → numeric fields only: age, league_tier
+- String equality (position, league_slug, season) → use $match AFTER $search
+- Nationality filtering → include it in the text query (e.g. "South American midfielder")
 
 Step 2 — GET FULL PROFILES
 For the top 2–3 candidates call find on gemscout.players:

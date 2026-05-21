@@ -84,8 +84,10 @@ systemInstruction: |
                     "stats":1,"metrics_normalized":1,"profile_text":1 } }
   ]
   ```
-  Include only the filter clauses that apply. String fields (position, league_slug,
-  season) use "equals"; numeric fields (age, league_tier) use "range".
+  Include only filter clauses that apply. IMPORTANT:
+  - "range" works for numeric fields: age, league_tier
+  - String equality (position, league_slug): add $match AFTER $search, NOT inside filter
+  - Nationality: put it in the text query itself ("South American midfielder")
 
   Step 2 — GET FULL PROFILES
   For the top 2–3 candidates, call find on gemscout.players:

@@ -84,19 +84,17 @@ app.get("/sse", async (req, res) => {
       if (!line.trim()) continue;
       try {
         const msg = JSON.parse(line);
-        // Resolve internal pending calls (prefixed "__") without forwarding to client
+        // Resolve internal auto-connect call — never forward to client (has credentials)
         if (typeof msg.id === "string" && msg.id.startsWith("__")) {
           if (pending.has(msg.id)) {
             pending.get(msg.id)(msg);
             pending.delete(msg.id);
           }
-          continue; // don't forward internal responses (may contain credentials)
+          continue;
         }
+        // All other messages (initialize responses, tool results, notifications)
+        // flow back to the client via SSE — this is the MCP SSE transport spec
         res.write(`data: ${JSON.stringify(msg)}\n\n`);
-        if (msg.id != null && pending.has(msg.id)) {
-          pending.get(msg.id)(msg);
-          pending.delete(msg.id);
-        }
       } catch { /* ignore non-JSON startup logs */ }
     }
   });
@@ -111,25 +109,29 @@ app.get("/sse", async (req, res) => {
     sessions.delete(sessionId);
   });
 
-  // Auto-connect to MongoDB using server-side credentials — keeps URI out of prompts
-  try {
-    await rpcToChild(proc, pending, "__init_connect__", "tools/call", {
-      name: "connect",
-      arguments: { connectionStringOrClusterName: MDB_URI },
-    });
-    console.log(`[${sessionId}] Auto-connected to MongoDB`);
-  } catch (err) {
-    console.error(`[${sessionId}] Auto-connect failed:`, err.message);
-  }
-
-  // Send endpoint info so client knows where to POST messages (absolute URL required)
+  // Send endpoint event FIRST — mcp/client/sse.py must receive this quickly
+  // or it times out waiting. Auto-connect runs in background so it doesn't block.
+  // mcp/client/sse.py does: endpoint_url = urljoin(base_url, sse.data)
   const host = req.headers["x-forwarded-host"] || req.headers.host || `localhost:${PORT}`;
   const proto = req.headers["x-forwarded-proto"] || "https";
   const base = `${proto}://${host}`;
-  res.write(`event: endpoint\ndata: ${JSON.stringify({ sessionId, messageUrl: `${base}/message?sessionId=${sessionId}` })}\n\n`);
+  res.write(`event: endpoint\ndata: ${base}/message?sessionId=${sessionId}\n\n`);
+
+  // Auto-connect to MongoDB in background — keeps URI server-side.
+  // MongoDB connection is ready well before any real tool call comes in.
+  rpcToChild(proc, pending, "__init_connect__", "tools/call", {
+    name: "connect",
+    arguments: { connectionStringOrClusterName: MDB_URI },
+  })
+    .then(() => console.log(`[${sessionId}] Auto-connected to MongoDB`))
+    .catch((err) => console.error(`[${sessionId}] Auto-connect failed:`, err.message));
 });
 
-// ─── Message endpoint — Agent Builder posts JSON-RPC here ───────────────────
+// ─── Message endpoint — client posts JSON-RPC here ──────────────────────────
+//
+// MCP SSE transport spec: POST /message returns 202 Accepted immediately.
+// The actual JSON-RPC response flows back via the SSE stream.
+// (We previously did synchronous HTTP response — wrong, breaks ADK & Agent Builder.)
 
 app.post("/message", (req, res) => {
   const { sessionId } = req.query;
@@ -141,18 +143,8 @@ app.post("/message", (req, res) => {
   const msg = req.body;
   session.proc.stdin.write(JSON.stringify(msg) + "\n");
 
-  // For method calls, wait for response
-  if (msg.method && msg.id != null) {
-    session.pending.set(msg.id, (response) => res.json(response));
-    setTimeout(() => {
-      if (session.pending.has(msg.id)) {
-        session.pending.delete(msg.id);
-        res.status(504).json({ error: "timeout" });
-      }
-    }, 30000);
-  } else {
-    res.json({ ok: true });
-  }
+  // Spec-compliant: acknowledge receipt, response comes via SSE
+  res.status(202).end();
 });
 
 // ─── Health check ────────────────────────────────────────────────────────────
