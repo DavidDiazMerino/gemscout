@@ -86,42 +86,43 @@ async def semantic_player_search(
 
     query_vector = embed_query(query)
 
-    # Build Atlas Vector Search pipeline
-    vector_stage = {
-        "$vectorSearch": {
-            "index": VECTOR_INDEX_NAME,
-            "path": "embedding",
-            "queryVector": query_vector,
-            "numCandidates": 200,
-            "limit": limit * 4,  # Over-fetch to allow post-filtering
-        }
-    }
-
-    # Post-filter stage
-    match_conditions: dict = {"season": season}
+    # Build inline MQL filter for $vectorSearch.
+    # All fields here are declared as {"type":"filter"} in the player_embedding_index,
+    # so filtering happens INSIDE the ANN search — no post-$match needed.
+    filter_clauses: list[dict] = [{"season": {"$eq": season}}]
     if position:
-        match_conditions["position"] = position.upper()
-    if max_age is not None:
-        match_conditions["age"] = {"$lte": max_age}
-    if min_age is not None:
-        match_conditions.setdefault("age", {})["$gte"] = min_age
+        filter_clauses.append({"position": {"$eq": position.upper()}})
+    if max_age is not None and min_age is not None:
+        filter_clauses.append({"age": {"$gte": min_age, "$lte": max_age}})
+    elif max_age is not None:
+        filter_clauses.append({"age": {"$lte": max_age}})
+    elif min_age is not None:
+        filter_clauses.append({"age": {"$gte": min_age}})
     tier_cond: dict = {}
     if league_tier_max is not None:
         tier_cond["$lte"] = league_tier_max
     if league_tier_min is not None:
         tier_cond["$gte"] = league_tier_min
     if tier_cond:
-        match_conditions["league_tier"] = tier_cond
+        filter_clauses.append({"league_tier": tier_cond})
     if league_slug:
-        match_conditions["league_slug"] = league_slug
+        filter_clauses.append({"league_slug": {"$eq": league_slug}})
+
+    inline_filter = {"$and": filter_clauses} if len(filter_clauses) > 1 else filter_clauses[0]
 
     pipeline = [
-        vector_stage,
+        {
+            "$vectorSearch": {
+                "index": VECTOR_INDEX_NAME,
+                "path": "embedding",
+                "queryVector": query_vector,
+                "numCandidates": 200,
+                "limit": limit,
+                "filter": inline_filter,  # pre-filter inside $vectorSearch — no post-$match
+            }
+        },
         {"$addFields": {"vector_score": {"$meta": "vectorSearchScore"}}},
     ]
-    if match_conditions:
-        pipeline.append({"$match": match_conditions})
-    pipeline.append({"$limit": limit})
 
     results = []
     async for doc in collection.aggregate(pipeline):

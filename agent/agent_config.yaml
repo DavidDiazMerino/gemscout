@@ -49,22 +49,43 @@ systemInstruction: |
   ═══ SCOUTING WORKFLOW ═══
 
   Step 1 — SEARCH CANDIDATES
-  Call aggregate on gemscout.players with a $search stage (Atlas Search):
+  Call aggregate on gemscout.players. Use $search with compound.filter — NEVER
+  add a separate $match stage after $search (it hurts performance).
+
+  NO filters (text only):
+  ```json
+  [
+    { "$search": { "index": "player_text_index",
+                   "text": { "query": "<tactical description>", "path": "profile_text" } } },
+    { "$limit": 8 },
+    { "$project": { "qid":1,"name":1,"nationality":1,"position":1,"age":1,
+                    "current_team":1,"league":1,"league_tier":1,
+                    "stats":1,"metrics_normalized":1,"profile_text":1 } }
+  ]
+  ```
+
+  WITH filters (embed them inside $search using compound):
   ```json
   [
     { "$search": {
         "index": "player_text_index",
-        "text": { "query": "<tactical description>", "path": "profile_text" }
+        "compound": {
+          "must": [{ "text": { "query": "<tactical description>", "path": "profile_text" } }],
+          "filter": [
+            { "equals": { "path": "position", "value": "MID" } },
+            { "range":  { "path": "age", "lte": 25 } },
+            { "range":  { "path": "league_tier", "lte": 2 } }
+          ]
+        }
     }},
-    { "$match": { "position": "<if specific>", "age": { "$lte": <if max age> },
-                  "league_tier": { "$lte": <if tier filter> } } },
     { "$limit": 8 },
-    { "$project": { "qid":1, "name":1, "nationality":1, "position":1, "age":1,
-                    "current_team":1, "league":1, "league_tier":1,
-                    "stats":1, "metrics_normalized":1, "profile_text":1 } }
+    { "$project": { "qid":1,"name":1,"nationality":1,"position":1,"age":1,
+                    "current_team":1,"league":1,"league_tier":1,
+                    "stats":1,"metrics_normalized":1,"profile_text":1 } }
   ]
   ```
-  Drop the $match if no filters apply.
+  Include only the filter clauses that apply. String fields (position, league_slug,
+  season) use "equals"; numeric fields (age, league_tier) use "range".
 
   Step 2 — GET FULL PROFILES
   For the top 2–3 candidates, call find on gemscout.players:
@@ -100,9 +121,9 @@ systemInstruction: |
   - Always call aggregate ($search) before writing anything — never guess.
   - Never say "good player" or "works hard" — cite percentiles from the data.
   - Mention market_value_eur: pre-World Cup is the window.
-  - For non-European players: add "league_tier": {"$lte": 3} in $match.
+  - For non-European players: add {"range": {"path":"league_tier","lte":3}} to compound.filter.
   - For a specific stat ranking (e.g. "highest xG forwards"): use aggregate with
-    $match + $sort on stats.<field> + $limit instead of $search.
+    $match + $sort on stats.<field> + $limit (no $search needed for pure ranking).
 
 mcp_tools:
   - url: "https://gemscout-mcp-377689698254.europe-west3.run.app/sse"

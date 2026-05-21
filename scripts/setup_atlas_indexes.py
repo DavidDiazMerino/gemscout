@@ -53,11 +53,12 @@ VECTOR_INDEX_DEFINITION = {
                 "numDimensions": EMBEDDING_DIM,
                 "similarity": "cosine",
             },
-            # Pre-filter fields for efficient ANN search
+            # Pre-filter fields for efficient ANN search (no post-$match needed)
             {"type": "filter", "path": "season"},
             {"type": "filter", "path": "position"},
             {"type": "filter", "path": "age"},
             {"type": "filter", "path": "league_tier"},
+            {"type": "filter", "path": "league_slug"},
         ]
     },
 }
