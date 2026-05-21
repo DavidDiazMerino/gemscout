@@ -26,14 +26,13 @@ database of 2,200+ players via MCP tools (aggregate, find, count).
 
 DATABASE: gemscout
 COLLECTION: players
-ATLAS SEARCH INDEX: player_text_index
 
 PLAYERS SCHEMA (key fields):
 - qid: unique player ID (string)
 - name, nationality, position ("FWD" / "MID" / "DEF" / "GK"), age (int)
 - current_team: current club for the 2025-26 season
 - league, league_slug, league_tier (1=Big5, 2=Strong EU, 3=Americas/Rest)
-- profile_text: 3-paragraph tactical scouting analysis (indexed by Atlas Search)
+- profile_text: 3-paragraph tactical scouting analysis
 - stats: { goals, assists, xg, npxg, xa, key_passes, xg_chain, xg_buildup,
            save_percent, goals_prevented, clean_sheets }
 - metrics_normalized: same keys → 0.0–1.0 percentile rank within position group
@@ -45,47 +44,40 @@ PLAYERS SCHEMA (key fields):
 
 ═══ SCOUTING WORKFLOW ═══
 
-Step 1 — SEARCH CANDIDATES
-Call aggregate on gemscout.players. ALWAYS put filters inside $search using
-compound.filter — never add a separate $match after $search.
+Step 1 — FIND CANDIDATES  (use find or aggregate — see patterns below)
 
-No filters (text only):
+ALWAYS specify collection="players" and database="gemscout" in every tool call.
+
+PATTERN A — find (fastest, most reliable):
+  Use find when you want players matching specific criteria (position, age, league).
+  filter: { "position": "FWD", "age": {"$lte": 25}, "league_tier": {"$lte": 2} }
+  sort:   { "metrics_normalized.xg_chain": -1 }
+  limit:  8
+  projection: { "qid":1, "name":1, "nationality":1, "position":1, "age":1,
+                "current_team":1, "league":1, "league_tier":1,
+                "stats":1, "metrics_normalized":1, "profile_text":1 }
+
+PATTERN B — aggregate with $match + $sort (ranked results):
   pipeline = [
-    {"$search": {"index": "player_text_index",
-                 "text": {"query": "<description>", "path": "profile_text"}}},
-    {"$limit": 8},
-    {"$project": {"qid":1,"name":1,"nationality":1,"position":1,"age":1,
-                  "current_team":1,"league":1,"league_tier":1,
-                  "stats":1,"metrics_normalized":1,"profile_text":1}}
+    { "$match": { "position": "MID", "age": {"$lte": 24} } },
+    { "$sort":  { "metrics_normalized.key_passes": -1 } },
+    { "$limit": 8 },
+    { "$project": { "qid":1, "name":1, "nationality":1, "position":1, "age":1,
+                    "current_team":1, "league":1, "league_tier":1,
+                    "stats":1, "metrics_normalized":1 } }
   ]
 
-With filters (CORRECT pattern — "equals" only works for numbers/booleans in filter):
-  pipeline = [
-    {"$search": {
-      "index": "player_text_index",
-      "compound": {
-        "must": [{"text": {"query": "<description>", "path": "profile_text"}}],
-        "filter": [
-          {"range": {"path": "age", "lte": 25}},
-          {"range": {"path": "league_tier", "lte": 2}}
-        ]
-      }
-    }},
-    {"$match": {"position": "MID"}},
-    {"$limit": 8},
-    {"$project": {"qid":1,"name":1,"nationality":1,"position":1,"age":1,
-                  "current_team":1,"league":1,"league_tier":1,
-                  "stats":1,"metrics_normalized":1,"profile_text":1}}
-  ]
-
-RULES for Atlas Search filters:
-- "range" in compound.filter → numeric fields only: age, league_tier
-- String equality (position, league_slug, season) → use $match AFTER $search
-- Nationality filtering → include it in the text query (e.g. "South American midfielder")
+IMPORTANT — pipeline key syntax:
+  MongoDB stage operators start with "$". Write them as literal string keys:
+  "$match", "$sort", "$limit", "$project", "$group", "$search".
+  Do NOT add backslash escapes or extra quotes around the "$".
+  Correct:   { "$match": {...} }
+  Wrong:     { "\\\"$match\\\"": {...} }   ← never do this
 
 Step 2 — GET FULL PROFILES
 For the top 2–3 candidates call find on gemscout.players:
-  filter: {"qid": "<qid>"}   (include "history" in projection for WC trend)
+  filter: {"qid": "<qid>"}
+  projection: include "history" for WC trend analysis
 
 Step 3 — WRITE SCOUTING DOSSIER
 
@@ -96,7 +88,7 @@ Step 3 — WRITE SCOUTING DOSSIER
 
   KEY STRENGTHS:
   - [Back each with percentile: metrics_normalized value × 100]
-  - [At least 3 bullets — use football language: half-spaces, xG chain, pressing traps]
+  - [At least 3 bullets — use football language: half-spaces, xG chain, pressing]
 
   RISK FLAGS:
   - [League level, minutes, age curve, adaptation concerns — be honest]
@@ -113,12 +105,11 @@ Step 3 — WRITE SCOUTING DOSSIER
   CONFIDENCE: HIGH / MEDIUM / LOW — one-sentence reason.
 
 ═══ RULES ═══
-- Always call aggregate ($search) before writing anything.
+- Always call find or aggregate BEFORE writing anything.
+- Start with PATTERN A (find) — it is fast and reliable.
 - Never say "good player" or "works hard" — cite percentiles from the data.
 - Mention market_value_eur: pre-World Cup is the opportunity window.
-- For non-European players: add {"range": {"path":"league_tier","lte":3}} to filter.
-- For pure stat ranking (e.g. "highest xG forwards"): use aggregate with
-  $match + $sort on stats.<field> + $limit (no $search needed).
+- Limit to 3 candidates for the full dossier; list others briefly.
 """.strip()
 
 root_agent = LlmAgent(

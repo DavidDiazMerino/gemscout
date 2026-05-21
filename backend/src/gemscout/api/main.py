@@ -720,6 +720,10 @@ async def _adk_event_stream(user_message: str):
 
     step_idx = 0
     seen_qids: set[str] = set()
+    # Track pending function calls by ID to avoid duplicate step_start events.
+    # ADK emits the functionCall in two events: first as a standalone call, then
+    # bundled with the functionResponse. We only want one step_start per call.
+    pending_steps: dict[str, int] = {}  # fc_id → step_idx
 
     try:
         async with httpx.AsyncClient(timeout=180.0) as client:
@@ -759,21 +763,32 @@ async def _adk_event_stream(user_message: str):
                         continue
 
                     author = event.get("author", "")
-                    for part in event.get("content", {}).get("parts", []):
+                    parts = event.get("content", {}).get("parts", [])
+
+                    for part in parts:
                         if "functionCall" in part:
                             fc = part["functionCall"]
-                            step_idx += 1
-                            args_preview = _json.dumps(fc.get("args", {}))[:400]
-                            yield sse({
-                                "type": "step_start",
-                                "step": step_idx,
-                                "action": f"mcp:{fc['name']}",
-                                "detail": f"MCP tool call → {fc['name']}({args_preview})",
-                            })
+                            # Use the call's ID (or name) as dedup key.
+                            fc_id = fc.get("id") or fc.get("name", "")
+                            if fc_id not in pending_steps:
+                                step_idx += 1
+                                pending_steps[fc_id] = step_idx
+                                args_preview = _json.dumps(fc.get("args", {}))[:400]
+                                yield sse({
+                                    "type": "step_start",
+                                    "step": step_idx,
+                                    "action": f"mcp:{fc['name']}",
+                                    "detail": f"MCP tool call → {fc['name']}({args_preview})",
+                                })
+                            # else: duplicate emission from ADK — skip
 
                         elif "functionResponse" in part:
                             resp_data = part["functionResponse"]
                             tool_name = resp_data.get("name", "")
+                            # Resolve the step number this response belongs to.
+                            fc_id = resp_data.get("id") or resp_data.get("name", "")
+                            current_step = pending_steps.pop(fc_id, step_idx)
+
                             content_items = resp_data.get("response", {}).get("content", [])
                             summary = ""
                             docs_streamed = 0
@@ -799,7 +814,7 @@ async def _adk_event_stream(user_message: str):
                                 summary = f"Streamed {docs_streamed} player document(s)"
                             yield sse({
                                 "type": "step_done",
-                                "step": step_idx,
+                                "step": current_step,
                                 "tool": tool_name,
                                 "result_summary": summary or "completed",
                             })
