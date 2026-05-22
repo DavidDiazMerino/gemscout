@@ -1099,6 +1099,7 @@ async def _similar_event_stream(qid: str):
                     return
 
                 wrote_writing_step = False
+                total_text_chars = 0  # track to detect ADK's final complete-text dump
                 async for raw_line in resp.aiter_lines():
                     if not raw_line or not raw_line.startswith("data: "):
                         continue
@@ -1110,6 +1111,16 @@ async def _similar_event_stream(qid: str):
                     author = event.get("author", "")
                     for part in event.get("content", {}).get("parts", []):
                         if "text" in part and author == "gemscout" and part["text"]:
+                            chunk = part["text"]
+                            # Skip the ADK's final complete-text dump.
+                            # ADK streams small chunks, then re-emits the full assembled
+                            # response in one big event at the end — drop it to avoid doubling.
+                            if chunk and total_text_chars > 300 and len(chunk) > total_text_chars * 0.4:
+                                logger.debug(
+                                    "Skipping ADK final text dump in similar stream (%d chars, total_so_far=%d)",
+                                    len(chunk), total_text_chars,
+                                )
+                                continue
                             if not wrote_writing_step:
                                 step_idx += 1
                                 yield sse({
@@ -1119,7 +1130,8 @@ async def _similar_event_stream(qid: str):
                                     "detail": "Gemini 3 Pro composing comparison dossier from $vectorSearch results",
                                 })
                                 wrote_writing_step = True
-                            yield sse({"type": "text", "chunk": part["text"]})
+                            total_text_chars += len(chunk)
+                            yield sse({"type": "text", "chunk": chunk})
 
                 if wrote_writing_step:
                     yield sse({
