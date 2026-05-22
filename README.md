@@ -2,14 +2,22 @@
 
 > **Google Cloud Rapid Agent Hackathon 2026** · MongoDB Track
 
+---
+
+## License
+
+**MIT** — free to use, fork, and build on.
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-lime.svg?style=for-the-badge)](LICENSE)
+[![Built with Gemini 3.1 Pro](https://img.shields.io/badge/Built%20with-Gemini%203.1%20Pro-blue?style=for-the-badge)](https://cloud.google.com/vertex-ai)
+[![MongoDB Atlas MCP](https://img.shields.io/badge/Data-MongoDB%20Atlas%20MCP-green?style=for-the-badge)](https://www.mongodb.com/atlas)
+[![Google ADK](https://img.shields.io/badge/Agent-Google%20ADK-orange?style=for-the-badge)](https://google.github.io/adk-docs/)
+
+---
+
 **Find the hidden gems before anyone else.**
 
-GemScout is a World Cup 2026 scouting agent that helps national team directors discover underrated players using semantic search, 3-season trend analysis, and Gemini-generated tactical dossiers — streamed live as the AI reasons.
-
-[![License: MIT](https://img.shields.io/badge/License-MIT-lime.svg)](LICENSE)
-[![Built with Gemini 3.1 Pro](https://img.shields.io/badge/Built%20with-Gemini%203.1%20Pro-blue)](https://cloud.google.com/vertex-ai)
-[![MongoDB Atlas Partner MCP](https://img.shields.io/badge/Data-MongoDB%20Atlas%20MCP-green)](https://www.mongodb.com/atlas)
-[![Google ADK](https://img.shields.io/badge/Agent-Google%20ADK-orange)](https://google.github.io/adk-docs/)
+GemScout lets you discover the stars of the 2026 World Cup before they make it onto everyone's radar — type a tactical description, watch the AI reason in real time, and get a full scouting dossier streamed token by token.
 
 🔴 **Live demo:** https://gemscout-frontend-377689698254.europe-west3.run.app
 
@@ -17,9 +25,9 @@ GemScout is a World Cup 2026 scouting agent that helps national team directors d
 
 ## The Problem
 
-A national team director preparing for the 2026 World Cup faces an impossible task: manually scouting 2,200+ players across 20+ leagues, comparing tactical profiles and statistical trajectories, all before the transfer window closes.
+The 2026 World Cup has 48 teams and 1,056 squad spots. Across the five major European leagues there are 2,200+ players to evaluate — different positions, tactical profiles, market values, and 3-season trajectories. Doing this manually is impossible before the window closes.
 
-GemScout solves this with a single natural language query.
+GemScout solves it with a single natural language query.
 
 ---
 
@@ -29,7 +37,7 @@ Most scouting tools are dashboards with filters. GemScout is an **AI agent** tha
 
 1. Understands tactical intent — *"box-to-box midfielder, high pressing"* is not a keyword search, it's a semantic concept
 2. Shows its reasoning — every MongoDB tool call is visible in real time as it happens
-3. Streams the dossier token by token — the AI "thinks" in front of you
+3. Streams the dossier token by token — the AI thinks in front of you
 4. Finds tactically similar players — one click on any player card runs a similarity search across the entire database
 
 ---
@@ -43,7 +51,7 @@ User (natural language query)
 FastAPI Backend (/agent/scout/stream)
         │  HTTP POST /run_sse
         ▼
-Google ADK Agent (Cloud Run)         ← gemini-3.1-pro-preview
+Google ADK Agent (Cloud Run)              ← gemini-3.1-pro-preview
         │  MCP tool calls (SSE transport)
         ▼
 @mongodb-js/mongodb-mcp-server (Cloud Run)   ← official partner MCP server
@@ -103,7 +111,7 @@ React + TypeScript UI
 
 ## Data
 
-- **2,200+ players** — Big-5 Europe, Brasileirão, Liga MX, MLS, and 15+ leagues
+- **2,200+ players** across the five major European leagues (Premier League, La Liga, Bundesliga, Serie A, Ligue 1)
 - **Current season**: 2025-26
 - **Historical**: 2024-25 and 2023-24 in `history.{season}` subdocuments — 3-season World Cup cycle trend analysis
 - **Stats**: xG, xA, goals, assists, key passes, xG chain, xG buildup, minutes, goalkeeper-specific metrics
@@ -130,7 +138,7 @@ React + TypeScript UI
 2. FastAPI fetches that player's `profile_text` from MongoDB
 3. Runs `$search` with `moreLikeThis` — finds the 5 tactically closest players
 4. Sends candidates to ADK for a head-to-head comparison dossier
-5. Everything streams via SSE — players cards first, then dossier
+5. Everything streams via SSE — player cards first, then dossier
 
 ### ⚡ Judges Panel
 
@@ -179,7 +187,6 @@ gemscout/
 - MongoDB Atlas M10+ cluster
 - Voyage AI API key — [voyageai.com](https://voyageai.com)
 - Google Cloud project with Vertex AI enabled (`GOOGLE_CLOUD_LOCATION=global` for Gemini 3 models)
-- `npm install -g @mongodb-js/mongodb-mcp-server` for local MCP
 
 ### 1. Clone & configure
 
@@ -213,7 +220,7 @@ In Atlas UI → Search → Create Search Index:
 cd backend && pip install -e .
 uvicorn gemscout.api.main:app --reload --port 8080
 
-# ADK Agent (in another terminal)
+# ADK Agent (separate terminal)
 cd agent && pip install google-adk[mcp]==2.0.0
 # Edit MCP_SSE_URL in agent/gemscout_agent/__init__.py to point to your local MCP
 adk api_server --port 8000
@@ -225,14 +232,7 @@ VITE_API_TARGET=http://localhost:8080 npm run dev
 
 ### 5. Deploy to Cloud Run
 
-All four services deploy via `gcloud run deploy --source`:
-
 ```bash
-# MCP server
-gcloud run deploy gemscout-mcp \
-  --image europe-west3-docker.pkg.dev/.../mongodb-mcp \
-  --region europe-west3 --allow-unauthenticated
-
 # ADK Agent
 gcloud run deploy gemscout-agent \
   --source ./agent \
@@ -260,14 +260,6 @@ gcloud run deploy gemscout-frontend \
 - *"Pressing forward, under 23, similar to Gnabry — explosive, goals and assists"*
 - *"Creative attacking midfielder in La Liga, under 26, elite chance creation"*
 - *"South American midfielder playing in Europe, under 25, undervalued hidden gem"*
-
----
-
-## Credits
-
-Built on top of [OpenMercat](https://github.com/DavidDiazMerino/openmercat) — an open football analytics platform.
-
-Data: SofaScore · FBRef · Transfermarkt · Wikidata
 
 ---
 
