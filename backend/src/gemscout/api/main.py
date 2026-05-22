@@ -320,7 +320,7 @@ async def rankings_preview(body: RankingPreviewRequest):
         raise HTTPException(status_code=400, detail="weights must sum to a positive number")
     normalised = {k: v / total_weight for k, v in body.weights.items()}
 
-    cursor = db[PLAYERS_COLLECTION].find(query, {"embedding": 0}).limit(1000)
+    cursor = db[PLAYERS_COLLECTION].find(query, {"embedding": 0}).limit(200)
 
     results = []
     async for doc in cursor:
@@ -1099,7 +1099,7 @@ async def _similar_event_stream(qid: str):
                     return
 
                 wrote_writing_step = False
-                total_text_chars = 0  # track to detect ADK's final complete-text dump
+                first_chunk_prefix = ""  # prefix of first emitted chunk (to detect the final dump)
                 async for raw_line in resp.aiter_lines():
                     if not raw_line or not raw_line.startswith("data: "):
                         continue
@@ -1112,15 +1112,23 @@ async def _similar_event_stream(qid: str):
                     for part in event.get("content", {}).get("parts", []):
                         if "text" in part and author == "gemscout" and part["text"]:
                             chunk = part["text"]
-                            # Skip the ADK's final complete-text dump.
-                            # ADK streams small chunks, then re-emits the full assembled
-                            # response in one big event at the end — drop it to avoid doubling.
-                            if chunk and total_text_chars > 300 and len(chunk) > total_text_chars * 0.4:
+                            # Detect the ADK's final complete-text dump.
+                            # ADK streams incremental chunks, then at the end re-emits the full
+                            # assembled response in one big event. The dump ALWAYS starts from
+                            # the beginning of the response, so it starts with the same text as
+                            # our first chunk. Any regular mid-stream chunk won't match.
+                            stripped = chunk.lstrip()
+                            if (first_chunk_prefix and
+                                    len(chunk) > 150 and
+                                    stripped[:len(first_chunk_prefix)] == first_chunk_prefix):
                                 logger.debug(
-                                    "Skipping ADK final text dump in similar stream (%d chars, total_so_far=%d)",
-                                    len(chunk), total_text_chars,
+                                    "Skipping ADK final text dump in similar stream (%d chars)",
+                                    len(chunk),
                                 )
                                 continue
+                            # Store prefix of first real chunk for future dump detection
+                            if not first_chunk_prefix and stripped:
+                                first_chunk_prefix = stripped[:30]
                             if not wrote_writing_step:
                                 step_idx += 1
                                 yield sse({
@@ -1130,7 +1138,6 @@ async def _similar_event_stream(qid: str):
                                     "detail": "Gemini 3 Pro composing comparison dossier from $vectorSearch results",
                                 })
                                 wrote_writing_step = True
-                            total_text_chars += len(chunk)
                             yield sse({"type": "text", "chunk": chunk})
 
                 if wrote_writing_step:
